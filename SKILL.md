@@ -28,10 +28,10 @@ mileage add --car ID --mileage KM [--datetime DT] [--note NOTE]   记录里程
 mileage list --car ID                      列出里程记录
 mileage delete <ID>                        删除记录
 
-refuel add --car ID --liters L --cost C --mileage KM [--datetime DT] [--note NOTE]   记录加油
+refuel add --car ID --liters L --cost C --mileage KM [--partial] [--datetime DT] [--note NOTE]   记录加油（默认加满，--partial 标记未加满）
 refuel list --car ID                       列出加油记录
 refuel delete <ID>                         删除记录
-refuel consumption --car ID                查看油耗统计
+refuel consumption --car ID                查看油耗统计（自动合并未加满记录）
 
 maintenance add --car ID --mileage KM [--cost C] [--datetime DT] [--note NOTE]   记录保养
 maintenance list --car ID                  列出保养记录
@@ -74,8 +74,10 @@ bun scripts/carlog.js maintenance since --car <ID>
 触发词：加了多少油、花了xxx加油、加了xx升油
 
 ```bash
-bun scripts/carlog.js refuel add --car <ID> --liters <升数> --cost <金额> --mileage <当前里程>
+bun scripts/carlog.js refuel add --car <ID> --liters <升数> --cost <金额> --mileage <当前里程> [--partial]
 ```
+
+默认按加满处理。如果没加满，加 `--partial` 标记。油耗计算会自动合并未加满的记录到下一次加满。
 
 **成功后必须追加执行：**
 ```bash
@@ -121,6 +123,8 @@ bun scripts/carlog.js stats expenses --car <ID> [--year <年>] [--month <月>]
    - 如果提供时间：新里程必须 ≥ 小于该时间的所有记录的最大里程，并且 ≤ 大于该时间的所有记录的最小里程
    - 如果不提供时间：新里程必须 ≥ 所有记录的最大里程
 2. **里程是总里程**：用户说"今天跑了300公里"需要从上下文推断总里程，不是增量。
-3. **油耗计算**：基于连续两次加油记录，假设每次加满。
-4. **默认当前时间**：用户未指定日期时不传 `--datetime`。
-5. **用简洁清晰的列表格式回复**：不要直接展示原始表格输出，用简洁的列表格式呈现关键信息，不加粗，使用纯文本列表格式。
+3. **油耗计算**：基于连续加油记录，支持未加满（`--partial`）标记。遇到未加满的记录会自动累加到下一次加满再计算。`is_full` 字段：1=加满（默认），0=未加满。
+4. **不要自行判断是否加满**：加油量少不一定意味着没加满（可能只是跑的里程短油箱没空）。是否加满应由用户告知，不要根据加油量自行假设。
+5. **默认当前时间**：用户未指定日期时不传 `--datetime`。
+6. **用简洁清晰的列表格式回复**：不要直接展示原始表格输出，用简洁的列表格式呈现关键信息，不加粗，使用纯文本列表格式。
+7. **源码仓库**：`git@github.com:zengkang/car-tracker.git`（主仓库）含 TypeScript 源码在 `src/`，子模块 `skills/car-log` 指向 `git@github.com:zengkang/car-log.git`。修改源码后 `bun run build` 编译到 `skills/car-log/scripts/carlog.js`，再复制到 `~/.hermes/skills/openclaw-imports/car-log/scripts/`。
