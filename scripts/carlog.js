@@ -57,6 +57,9 @@ function initDb(db) {
   db.exec(CREATE_VEHICLES_TABLE);
   db.exec(CREATE_RECORDS_TABLE);
   db.exec(CREATE_INDEXES);
+  try {
+    db.exec("ALTER TABLE records ADD COLUMN is_full INTEGER NOT NULL DEFAULT 1");
+  } catch (e) {}
 }
 
 // src/vehicle.ts
@@ -266,9 +269,10 @@ function addRefuelRecord(db, input) {
   }
   validateMileage(db, input.vehicle_id, input.mileage, input.datetime);
   const datetime = parseDatetime(input.datetime);
-  const result = db.query(`INSERT INTO records (vehicle_id, record_type, mileage, datetime, note, liters, cost)
-       VALUES (?, 'refuel', ?, ?, ?, ?, ?)
-       RETURNING id`).get(input.vehicle_id, input.mileage, datetime, input.note ?? null, input.liters, input.cost);
+  const isFull = input.is_full !== false ? 1 : 0;
+  const result = db.query(`INSERT INTO records (vehicle_id, record_type, mileage, datetime, note, liters, cost, is_full)
+       VALUES (?, 'refuel', ?, ?, ?, ?, ?, ?)
+       RETURNING id`).get(input.vehicle_id, input.mileage, datetime, input.note ?? null, input.liters, input.cost, isFull);
   return getRecordById2(db, result.id);
 }
 function listRefuelRecords(db, vehicleId) {
@@ -293,31 +297,43 @@ function calculateConsumption(db, vehicleId) {
   if (records.length < 2)
     return [];
   const results = [];
-  for (let i = 0;i < records.length - 1; i++) {
-    const prev = records[i];
-    const curr = records[i + 1];
-    if (prev.mileage === null || curr.mileage === null)
+  let pendingLiters = 0;
+  let pendingCost = 0;
+  let fromRecord = null;
+  for (let i = 0;i < records.length; i++) {
+    const r = records[i];
+    if (r.mileage === null || r.liters === null || r.liters <= 0)
       continue;
-    if (prev.liters === null || prev.liters <= 0)
+    const isFull = r.is_full === 1;
+    if (fromRecord === null) {
+      if (isFull) {
+        fromRecord = r;
+        pendingLiters = 0;
+        pendingCost = 0;
+      }
       continue;
-    if (prev.cost === null || curr.liters === null || curr.liters <= 0)
+    }
+    pendingLiters += r.liters;
+    pendingCost += r.cost ?? r.liters * (fromRecord.cost / fromRecord.liters);
+    if (!isFull)
       continue;
-    const distance = curr.mileage - prev.mileage;
+    const distance = r.mileage - fromRecord.mileage;
     if (distance <= 0)
       continue;
-    const prevPricePerLiter = prev.cost / prev.liters;
-    const cost = prev.liters * prevPricePerLiter;
     results.push({
-      from_datetime: prev.datetime,
-      to_datetime: curr.datetime,
-      from_mileage: prev.mileage,
-      to_mileage: curr.mileage,
+      from_datetime: fromRecord.datetime,
+      to_datetime: r.datetime,
+      from_mileage: fromRecord.mileage,
+      to_mileage: r.mileage,
       distance,
-      liters: prev.liters,
-      cost,
-      l_per_100km: prev.liters / distance * 100,
-      cost_per_km: cost / distance
+      liters: pendingLiters,
+      cost: pendingCost,
+      l_per_100km: pendingLiters / distance * 100,
+      cost_per_km: pendingCost / distance
     });
+    fromRecord = r;
+    pendingLiters = 0;
+    pendingCost = 0;
   }
   return results;
 }
@@ -466,7 +482,7 @@ function printUsage() {
     delete <ID>                      \u5220\u9664\u8BB0\u5F55
 
   refuel                 \u52A0\u6CB9\u8BB0\u5F55
-    add --car ID --liters L --cost C --mileage KM [--datetime DT] [--note NOTE]   \u6DFB\u52A0\u52A0\u6CB9\u8BB0\u5F55
+    add --car ID --liters L --cost C --mileage KM [--partial] [--datetime DT] [--note NOTE]   \u6DFB\u52A0\u52A0\u6CB9\u8BB0\u5F55\uFF08\u9ED8\u8BA4\u52A0\u6EE1\uFF0C--partial \u6807\u8BB0\u672A\u52A0\u6EE1\uFF09
     list --car ID                \u5217\u51FA\u52A0\u6CB9\u8BB0\u5F55
     delete <ID>                      \u5220\u9664\u8BB0\u5F55
     consumption --car ID         \u67E5\u770B\u6CB9\u8017\u7EDF\u8BA1
@@ -677,7 +693,8 @@ function handleRefuel(subcommand, args, positional) {
         cost,
         mileage,
         datetime: args["datetime"],
-        note: args["note"]
+        note: args["note"],
+        is_full: !args["partial"]
       });
       console.log(`\u2705 \u52A0\u6CB9\u8BB0\u5F55\u5DF2\u4FDD\u5B58: ${liters}L / ${formatCurrency(cost)}`);
       const previousRefuel = database.query("SELECT mileage, liters, cost FROM records WHERE vehicle_id = ? AND record_type = 'refuel' AND deleted = 0 ORDER BY datetime DESC LIMIT 1 OFFSET 1").get(vehicleId);
@@ -711,11 +728,12 @@ function handleRefuel(subcommand, args, positional) {
         console.log("\u6682\u65E0\u52A0\u6CB9\u8BB0\u5F55");
         return;
       }
-      console.log(table(["ID", "\u91CC\u7A0B(km)", "\u5347\u6570(L)", "\u82B1\u8D39(\u5143)", "\u65F6\u95F4", "\u5907\u6CE8"], records.map((r) => [
+      console.log(table(["ID", "\u91CC\u7A0B(km)", "\u5347\u6570(L)", "\u82B1\u8D39(\u5143)", "\u52A0\u6EE1", "\u65F6\u95F4", "\u5907\u6CE8"], records.map((r) => [
         r.id,
         r.mileage?.toLocaleString("zh-CN") ?? "-",
         r.liters ?? "-",
         r.cost ? r.cost.toFixed(2) : "-",
+        r.is_full === 1 ? "\u2705" : "\u26A0\uFE0F",
         r.datetime,
         r.note ?? "-"
       ])));
