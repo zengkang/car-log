@@ -17,6 +17,16 @@ bun scripts/carlog.js [命令] [子命令] [选项]
 
 脚本仍然需要 Bun 运行，因为项目使用 Bun 内置的 `bun:sqlite`；它不是脱离 Bun 的独立二进制。数据库默认在 `~/.car-log/car_log.db`，可用 `--db PATH` 或环境变量 `CAR_LOG_DB` 覆盖。
 
+## 源码与安装
+
+源码在主仓库 `git@github.com:zengkang/car-tracker.git` 的 `src/`；本 skill 是子模块 `skills/car-log`（`git@github.com:zengkang/car-log.git`）。修改源码后：
+
+```bash
+bun run build   # 生成 skills/car-log/scripts/carlog.js
+```
+
+如使用 Hermes/OpenClaw，本机安装位置是 `~/.hermes/skills/openclaw-imports/car-log/`；更新后同步 `SKILL.md` 和 `scripts/carlog.js` 到该目录。脚本需要 Bun 环境（`bun:sqlite`），不是独立二进制。
+
 **每次调用都必须加 `--json`。** JSON 成功信封为 `{ok:true, schema_version:2, data}`；失败信封为 `{ok:false, schema_version:2, error:{code,message,hint,details}}`。诊断信息在 stderr，stdout 只有 JSON。
 
 ## 命令参考
@@ -117,6 +127,7 @@ add/update 的 JSON 响应已经包含油耗、提醒和费用上下文：
 - `refuel add/update` 返回 `data.fuel`（`latest_segment`、`overall`、`pending`）。
 - `maintenance add/update` 返回 `data.items` 和 `data.reminders`。
 - `expense add/update` 返回累计 `data.totals`（全部时间口径，不是本期小计）。
+- `data.record.is_full` 是布尔值：`true` = 加满，`false` = 未加满（数据库内部仍存 1/0，不要直接引用内部值）。
 - `delete` 响应只含 `data.record` / `data.deleted`，不含提醒；删除后如果用户关心提醒，再调用一次 `remind --car CAR --json`。
 
 **不要**在 add/update 之后追加 `refuel consumption`、`maintenance since`、`maintenance status`、`stats fuel` 等查询。只有 delete 后需要提醒、或用户明确要求查询历史/诊断时才单独调用。
@@ -172,6 +183,7 @@ add/update 的 JSON 响应已经包含油耗、提醒和费用上下文：
 
 - 多辆车且无法从用户说法中唯一匹配：列出候选，问"是哪辆车"。
 - 加油没有说明是否加满：先问"这次加满了吗？"。用户不回答时不要写库；CLI 会以 `FULLNESS_REQUIRED` 拒绝缺少 `--full`/`--partial` 的记录。
+- 不要根据加油量自行判断是否加满：加得少不等于没加满（可能只是油箱没空），必须由用户明确说明。
 - 用户说"没加满"：可以再问"加完油后油表大概在什么位置？"（可选）。给出比例时用 `--fuel-level`（隐含 `--partial`）；不给出时只用 `--partial`。
 - 用户说"加了一半"：先确认是"加了半箱油"还是"加完后油表在一半"。
 - 保养项目无法解析：给出候选或问"具体换了什么"，不要静默使用 `other`。
