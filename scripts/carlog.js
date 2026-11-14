@@ -194,6 +194,14 @@ function toAppError(error) {
 }
 
 // src/cli/parser.ts
+var GLOBAL_FLAGS = new Map([
+  ["db", false],
+  ["json", true],
+  ["version", true]
+]);
+function isGlobalFlag(name) {
+  return GLOBAL_FLAGS.has(name);
+}
 function buildFlagArity(specs) {
   const arity = new Map;
   const register = (name, isBoolean) => {
@@ -203,9 +211,8 @@ function buildFlagArity(specs) {
     }
     arity.set(name, isBoolean);
   };
-  register("db", false);
-  register("json", true);
-  register("version", true);
+  for (const [name, isBoolean] of GLOBAL_FLAGS)
+    register(name, isBoolean);
   for (const spec of specs) {
     for (const flag of spec.flags ?? [])
       register(flag.name, flag.boolean === true);
@@ -299,7 +306,7 @@ function failUnknownFlag(name) {
 function validateFlags(spec, parsed) {
   const declared = new Map((spec.flags ?? []).map((flag) => [flag.name, flag]));
   for (const [name, value] of parsed.flags) {
-    if (name === "json" || name === "db" || name === "version")
+    if (isGlobalFlag(name))
       continue;
     const flag = declared.get(name);
     if (!flag)
@@ -367,7 +374,7 @@ function parseArgv(argv, specs, arity) {
   validatePositionals(command, rest);
   const flags = {};
   for (const [name, value] of parsed.flags) {
-    if (name === "json" || name === "db" || name === "version")
+    if (isGlobalFlag(name))
       continue;
     flags[name] = value;
   }
@@ -626,10 +633,29 @@ function parseEnumFlag(flag, raw, allowed) {
   }
   return raw;
 }
+function parseDateBound(flag, raw, endOfDay, now) {
+  if (raw === undefined)
+    return;
+  if (endOfDay && /^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    return `${raw} 23:59:59`;
+  }
+  return parseDatetimeFlag(flag, raw, now);
+}
+function parseListOptions(inv, ctx) {
+  return {
+    from: parseDateBound("from", getStringFlag(inv, "from"), false, ctx.now),
+    to: parseDateBound("to", getStringFlag(inv, "to"), true, ctx.now),
+    limit: parseNumberFlag("limit", getStringFlag(inv, "limit"), {
+      integer: true,
+      positive: true
+    }),
+    order: parseEnumFlag("order", getStringFlag(inv, "order"), ["asc", "desc"]) ?? "desc"
+  };
+}
 
 // src/db.ts
 import { Database } from "bun:sqlite";
-import { join } from "path";
+import { dirname, join } from "path";
 import { mkdirSync, existsSync } from "fs";
 import { homedir } from "os";
 
@@ -974,10 +1000,7 @@ function getDbPath(customPath) {
 }
 function createDatabase(dbPath) {
   if (dbPath !== ":memory:") {
-    const dir = dbPath.substring(0, dbPath.lastIndexOf("/"));
-    if (dir && !existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
-    }
+    mkdirSync(dirname(dbPath), { recursive: true });
   }
   const db = new Database(dbPath);
   db.exec("PRAGMA journal_mode = WAL");
@@ -1130,14 +1153,33 @@ function assertActiveVehicle(db, id) {
   }
   return vehicle;
 }
-function getCurrentMileage(db, vehicleId) {
-  const row = db.query(`SELECT mileage FROM records
+function getCurrentMileageInfo(db, vehicleId) {
+  const row = db.query(`SELECT mileage, datetime FROM records
        WHERE vehicle_id = ? AND deleted = 0 AND mileage IS NOT NULL
        ORDER BY datetime DESC, id DESC LIMIT 1`).get(vehicleId);
-  if (row)
-    return row.mileage;
-  const vehicle = db.query("SELECT initial_mileage FROM vehicles WHERE id = ? AND deleted = 0").get(vehicleId);
-  return vehicle?.initial_mileage ?? null;
+  if (row) {
+    return {
+      current_mileage: row.mileage,
+      current_mileage_datetime: row.datetime,
+      source: "record"
+    };
+  }
+  const vehicle = db.query("SELECT initial_mileage, initial_datetime FROM vehicles WHERE id = ? AND deleted = 0").get(vehicleId);
+  if (vehicle && vehicle.initial_mileage !== null) {
+    return {
+      current_mileage: vehicle.initial_mileage,
+      current_mileage_datetime: vehicle.initial_datetime,
+      source: "initial_mileage"
+    };
+  }
+  return {
+    current_mileage: null,
+    current_mileage_datetime: null,
+    source: null
+  };
+}
+function getCurrentMileage(db, vehicleId) {
+  return getCurrentMileageInfo(db, vehicleId).current_mileage;
 }
 function getPreviousRecord(db, vehicleId, datetime, options = {}) {
   const conditions = [
@@ -1965,7 +2007,7 @@ function requireDueSoonSettingKey(key) {
   }
   return key;
 }
-function parsePositiveIntegerSetting(key, raw) {
+function parsePositiveIntegerSetting(raw) {
   if (!/^\d+$/.test(raw.trim()))
     return null;
   const value = Number(raw.trim());
@@ -1981,7 +2023,7 @@ function getDueSoonSetting(db, key) {
   const raw = readSettingRow(db, settingKey);
   if (raw === undefined)
     return SETTING_DEFAULTS[settingKey];
-  return parsePositiveIntegerSetting(settingKey, raw) ?? SETTING_DEFAULTS[settingKey];
+  return parsePositiveIntegerSetting(raw) ?? SETTING_DEFAULTS[settingKey];
 }
 function setDueSoonSetting(db, key, value) {
   const settingKey = requireDueSoonSettingKey(key);
@@ -2043,14 +2085,36 @@ function countReminderStatuses(reminders) {
   return counts;
 }
 
-// src/records.ts
-var DUPLICATE_WINDOW_MINUTES = 10;
-var IDEMPOTENCY_KEY_PREFIX = "idempotency:";
+// src/models.ts
 var RECORD_TYPE_LABELS = {
   mileage: "\u91CC\u7A0B",
   refuel: "\u52A0\u6CB9",
   maintenance: "\u4FDD\u517B"
 };
+var EXPENSE_CATEGORY_CODES = [
+  "insurance",
+  "parking",
+  "toll",
+  "wash",
+  "repair",
+  "tax",
+  "fine",
+  "other"
+];
+var EXPENSE_CATEGORY_LABELS = {
+  insurance: "\u4FDD\u9669",
+  parking: "\u505C\u8F66",
+  toll: "\u8DEF\u6865",
+  wash: "\u6D17\u8F66",
+  repair: "\u76EE\u5F55\u5916\u7EF4\u4FEE",
+  tax: "\u7A0E\u8D39",
+  fine: "\u7F5A\u6B3E",
+  other: "\u5176\u4ED6"
+};
+
+// src/records.ts
+var DUPLICATE_WINDOW_MINUTES = 10;
+var IDEMPOTENCY_KEY_PREFIX = "idempotency:";
 function recordToView(record, options = {}) {
   return {
     id: options.preview === true ? null : record.id,
@@ -2212,6 +2276,16 @@ function storeIdempotencyKey(db, key, recordId) {
 }
 
 // src/fuel.ts
+function fuelOverview(summary) {
+  return {
+    latest_segment: summary.latest_segment,
+    overall: summary.overall,
+    pending: summary.pending,
+    unmeasured_partials: summary.unmeasured_partials,
+    warnings: summary.warnings,
+    confidence: summary.confidence
+  };
+}
 function finite(value) {
   if (value === null || value === undefined)
     return null;
@@ -2733,28 +2807,6 @@ function computeVehicleFuelSummary(db, vehicleId, options = {}) {
   return computeFuelSummary(records, options);
 }
 
-// src/models.ts
-var EXPENSE_CATEGORY_CODES = [
-  "insurance",
-  "parking",
-  "toll",
-  "wash",
-  "repair",
-  "tax",
-  "fine",
-  "other"
-];
-var EXPENSE_CATEGORY_LABELS = {
-  insurance: "\u4FDD\u9669",
-  parking: "\u505C\u8F66",
-  toll: "\u8DEF\u6865",
-  wash: "\u6D17\u8F66",
-  repair: "\u76EE\u5F55\u5916\u7EF4\u4FEE",
-  tax: "\u7A0E\u8D39",
-  fine: "\u7F5A\u6B3E",
-  other: "\u5176\u4ED6"
-};
-
 // src/stats.ts
 function warning2(code, message, details) {
   return details === undefined ? { code, message } : { code, message, details };
@@ -2840,31 +2892,6 @@ function resolvePeriod(options = {}) {
   }
   return { from, to, year: null, month: null };
 }
-function getCurrentMileageInfo(db, vehicleId) {
-  const row = db.query(`SELECT mileage, datetime FROM records
-       WHERE vehicle_id = ? AND deleted = 0 AND mileage IS NOT NULL
-       ORDER BY datetime DESC, id DESC LIMIT 1`).get(vehicleId);
-  if (row) {
-    return {
-      current_mileage: row.mileage,
-      current_mileage_datetime: row.datetime,
-      source: "record"
-    };
-  }
-  const vehicle = db.query("SELECT initial_mileage, initial_datetime FROM vehicles WHERE id = ? AND deleted = 0").get(vehicleId);
-  if (vehicle && vehicle.initial_mileage !== null) {
-    return {
-      current_mileage: vehicle.initial_mileage,
-      current_mileage_datetime: vehicle.initial_datetime,
-      source: "initial_mileage"
-    };
-  }
-  return {
-    current_mileage: null,
-    current_mileage_datetime: null,
-    source: null
-  };
-}
 function getBoundaryReadings(db, vehicleId, period) {
   const base = "SELECT id, datetime, mileage FROM records " + "WHERE vehicle_id = ? AND deleted = 0 AND mileage IS NOT NULL";
   let start;
@@ -2932,8 +2959,8 @@ function resolveMonthCount(period, span) {
     return monthCountBetween(span.first, span.last);
   return 1;
 }
-function distanceWarning(check, period, start, end) {
-  if (check.reason === "missing") {
+function distanceWarning(reason, period, start, end) {
+  if (reason === "missing") {
     return [
       warning2("DISTANCE_UNKNOWN", "\u7F3A\u5C11\u671F\u95F4\u8D77\u70B9\u6216\u7EC8\u70B9\u91CC\u7A0B\u8BFB\u6570\uFF0C\u65E0\u6CD5\u8BA1\u7B97\u8DDD\u79BB\u548C\u6BCF\u516C\u91CC\u6210\u672C", {
         from: period.from,
@@ -2943,7 +2970,7 @@ function distanceWarning(check, period, start, end) {
       })
     ];
   }
-  if (check.reason === "negative") {
+  if (reason === "negative") {
     return [
       warning2("DISTANCE_UNKNOWN", `\u7EC8\u70B9\u91CC\u7A0B ${end?.mileage ?? "-"} km \u5C0F\u4E8E\u8D77\u70B9\u91CC\u7A0B ${start?.mileage ?? "-"} km\uFF0C\u8DDD\u79BB\u89C6\u4E3A\u672A\u77E5`, {
         from: period.from,
@@ -3044,11 +3071,11 @@ function computeExpenseStats(db, vehicleId, options = {}) {
   const { start, end } = getBoundaryReadings(db, vehicleId, period);
   let distance = null;
   if (start === null || end === null) {
-    warnings.push(...distanceWarning({ distance: null, reason: "missing" }, period, start, end));
+    warnings.push(...distanceWarning("missing", period, start, end));
   } else {
     const candidate = end.mileage - start.mileage;
     if (candidate < 0) {
-      warnings.push(...distanceWarning({ distance: null, reason: "negative" }, period, start, end));
+      warnings.push(...distanceWarning("negative", period, start, end));
     } else if (candidate === 0) {
       distance = 0;
       warnings.push(warning2("DISTANCE_ZERO", "\u671F\u95F4\u8D77\u6B62\u91CC\u7A0B\u76F8\u540C\uFF0C\u8DDD\u79BB\u4E3A 0\uFF1B\u6BCF\u516C\u91CC\u6210\u672C\u65E0\u6CD5\u8BA1\u7B97", {
@@ -3061,14 +3088,15 @@ function computeExpenseStats(db, vehicleId, options = {}) {
       distance = candidate;
     }
   }
-  const fuelEngine = computeVehicleFuelSummary(db, vehicleId, {
-    currentMileage: getCurrentMileage(db, vehicleId),
+  const fuelEngine = options.fuelSummary ?? computeVehicleFuelSummary(db, vehicleId, {
+    currentMileage: options.currentMileage === undefined ? getCurrentMileage(db, vehicleId) : options.currentMileage,
     tankCapacityL: vehicle.tank_capacity_l,
     from: period.from ?? undefined,
     to: period.to ?? undefined
   });
   const total = fuel + maintenance + other;
   const perKm = (value) => distance !== null && distance > 0 ? value / distance : null;
+  const totalPerKm = perKm(total);
   const span = getRecordSpan(db, vehicleId);
   const days = resolveDayCount(period, span);
   const totals = {
@@ -3079,8 +3107,8 @@ function computeExpenseStats(db, vehicleId, options = {}) {
     distance,
     start_mileage: start?.mileage ?? null,
     end_mileage: end?.mileage ?? null,
-    cost_per_km: perKm(total),
-    total_cost_per_km: perKm(total),
+    cost_per_km: totalPerKm,
+    total_cost_per_km: totalPerKm,
     fuel_spent_per_km: perKm(fuel),
     fuel_consumption_cost: fuelEngine.overall?.cost ?? null,
     fuel_consumption_cost_per_km: fuelEngine.overall?.cost_per_km ?? null,
@@ -3136,11 +3164,11 @@ function computeMileageStats(db, vehicleId, options = {}) {
   const end = missing ? null : readings[readings.length - 1];
   let distance = null;
   if (start === null || end === null) {
-    warnings.push(...distanceWarning({ distance: null, reason: "missing" }, period, start, end));
+    warnings.push(...distanceWarning("missing", period, start, end));
   } else {
     const candidate = end.mileage - start.mileage;
     if (candidate < 0) {
-      warnings.push(...distanceWarning({ distance: null, reason: "negative" }, period, start, end));
+      warnings.push(...distanceWarning("negative", period, start, end));
     } else {
       distance = candidate;
       if (candidate === 0) {
@@ -3253,16 +3281,11 @@ function computeVehicleSummary(db, vehicleId, options = {}) {
   });
   const stats = computeExpenseStats(db, vehicleId, {
     from: period.from ?? undefined,
-    to: period.to ?? undefined
+    to: period.to ?? undefined,
+    fuelSummary: fuelEngine,
+    currentMileage: currentMileage.current_mileage
   });
-  const fuel = {
-    latest_segment: fuelEngine.latest_segment,
-    overall: fuelEngine.overall,
-    pending: fuelEngine.pending,
-    unmeasured_partials: fuelEngine.unmeasured_partials,
-    confidence: fuelEngine.confidence,
-    warnings: fuelEngine.warnings
-  };
+  const fuel = fuelOverview(fuelEngine);
   const reminders = getVehicleReminders(db, vehicleId, {
     now: options.now,
     today: options.today
@@ -3280,23 +3303,42 @@ function computeVehicleSummary(db, vehicleId, options = {}) {
   };
 }
 
-// src/cli/commands/summary.ts
-var STATUS_LABELS = {
+// src/cli/render.ts
+var REMINDER_STATUS_LABELS = {
   overdue: "\u5DF2\u903E\u671F",
   due_soon: "\u5373\u5C06\u5230\u671F",
   ok: "\u6B63\u5E38",
   unknown: "\u672A\u77E5"
 };
-function parseDateBound(flag, raw, endOfDay) {
-  if (raw === undefined)
-    return;
-  if (endOfDay && /^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    return `${raw} 23:59:59`;
+function writeWarnings(ctx, warnings) {
+  for (const warning3 of warnings) {
+    ctx.stderr(`\u8B66\u544A: ${warning3.message}
+`);
   }
-  return raw;
 }
-function periodText(summary) {
-  const { period } = summary;
+function renderUrgentReminders(ctx, reminders) {
+  for (const reminder of reminders) {
+    if (reminder.status !== "overdue" && reminder.status !== "due_soon")
+      continue;
+    const remaining = [];
+    if (reminder.remaining_km !== null) {
+      remaining.push(formatMileage(reminder.remaining_km));
+    }
+    if (reminder.remaining_days !== null) {
+      remaining.push(`${reminder.remaining_days} \u5929`);
+    }
+    writeLine(ctx, `\u63D0\u9192: ${reminder.name} (${reminder.item}) ${REMINDER_STATUS_LABELS[reminder.status]}` + (remaining.length > 0 ? `\uFF0C\u5269\u4F59 ${remaining.join(" / ")}` : ""));
+  }
+}
+function formatDue(mileage, datetime) {
+  const parts = [];
+  if (mileage !== null)
+    parts.push(formatMileage(mileage));
+  if (datetime !== null)
+    parts.push(datetime);
+  return parts.length > 0 ? parts.join(" / ") : "-";
+}
+function periodLabel(period) {
   if (period.year !== null && period.month !== null) {
     return `${period.year}\u5E74${period.month}\u6708`;
   }
@@ -3307,6 +3349,8 @@ function periodText(summary) {
   }
   return "\u5168\u90E8\u65F6\u95F4";
 }
+
+// src/cli/commands/summary.ts
 function renderReminder(ctx, reminder) {
   const details = [];
   if (reminder.remaining_km !== null) {
@@ -3315,13 +3359,10 @@ function renderReminder(ctx, reminder) {
   if (reminder.remaining_days !== null) {
     details.push(`${reminder.remaining_days} \u5929`);
   }
-  writeLine(ctx, `  ${reminder.name} (${reminder.item}): ${STATUS_LABELS[reminder.status]}` + (details.length > 0 ? `\uFF0C\u5269\u4F59 ${details.join(" / ")}` : ""));
+  writeLine(ctx, `  ${reminder.name} (${reminder.item}): ${REMINDER_STATUS_LABELS[reminder.status]}` + (details.length > 0 ? `\uFF0C\u5269\u4F59 ${details.join(" / ")}` : ""));
 }
 function renderSummaryHuman(ctx, summary) {
-  for (const warning3 of summary.warnings) {
-    ctx.stderr(`\u8B66\u544A: ${warning3.message}
-`);
-  }
+  writeWarnings(ctx, summary.warnings);
   writeLine(ctx, `\u8F66\u8F86: ${summary.vehicle.name} (ID: ${summary.vehicle.id})`);
   writeLine(ctx, `\u8F66\u724C: ${summary.vehicle.plate ?? "-"}`);
   writeLine(ctx, `\u5F53\u524D\u91CC\u7A0B: ${formatMileage(summary.vehicle.current_mileage)}` + (summary.current_mileage_datetime ? ` (${summary.current_mileage_datetime})` : ""));
@@ -3361,7 +3402,7 @@ function renderSummaryHuman(ctx, summary) {
       renderReminder(ctx, reminder);
   }
   const totals = summary.totals;
-  writeLine(ctx, `\u8D39\u7528 (${periodText(summary)}):`);
+  writeLine(ctx, `\u8D39\u7528 (${periodLabel(summary.period)}):`);
   writeLine(ctx, `  \u603B\u8BA1 ${formatCurrency(totals.total)}` + `\uFF08\u71C3\u6CB9 ${formatCurrency(totals.fuel)} / \u4FDD\u517B ${formatCurrency(totals.maintenance)} / \u5176\u4ED6 ${formatCurrency(totals.other)}\uFF09`);
   if (totals.distance === null) {
     writeLine(ctx, "  \u8DDD\u79BB\u672A\u77E5\uFF0C\u6BCF\u516C\u91CC\u6210\u672C\u4E0D\u53EF\u7528");
@@ -3403,8 +3444,8 @@ var summary = {
     const db = getCliDb(ctx);
     const vehicle = resolveVehicle(db, getStringFlag(inv, "car"));
     const data = computeVehicleSummary(db, vehicle.id, {
-      from: parseDateBound("from", getStringFlag(inv, "from"), false),
-      to: parseDateBound("to", getStringFlag(inv, "to"), true),
+      from: getStringFlag(inv, "from"),
+      to: getStringFlag(inv, "to"),
       now: ctx.now
     });
     emitSuccess(ctx, inv.globals.json, data, (target, value) => {
@@ -3834,53 +3875,6 @@ function listMileageRecords(db, vehicleId, options = {}) {
 }
 
 // src/cli/commands/mileage.ts
-var STATUS_LABELS2 = {
-  overdue: "\u5DF2\u903E\u671F",
-  due_soon: "\u5373\u5C06\u5230\u671F",
-  ok: "\u6B63\u5E38",
-  unknown: "\u672A\u77E5"
-};
-function renderUrgentReminders(ctx, reminders) {
-  for (const reminder of reminders) {
-    if (reminder.status !== "overdue" && reminder.status !== "due_soon")
-      continue;
-    const remaining = [];
-    if (reminder.remaining_km !== null) {
-      remaining.push(`${reminder.remaining_km.toLocaleString("zh-CN")} km`);
-    }
-    if (reminder.remaining_days !== null) {
-      remaining.push(`${reminder.remaining_days} \u5929`);
-    }
-    writeLine(ctx, `\u63D0\u9192: ${reminder.name} (${reminder.item}) ${STATUS_LABELS2[reminder.status]}` + (remaining.length > 0 ? `\uFF0C\u5269\u4F59 ${remaining.join(" / ")}` : ""));
-  }
-}
-function renderWarnings(ctx, json, warnings) {
-  if (json)
-    return;
-  for (const warning3 of warnings) {
-    ctx.stderr(`\u8B66\u544A: ${warning3.message}
-`);
-  }
-}
-function parseDateBound2(flag, raw, endOfDay, now) {
-  if (raw === undefined)
-    return;
-  if (endOfDay && /^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    return `${raw} 23:59:59`;
-  }
-  return parseDatetimeFlag(flag, raw, now);
-}
-function parseListOptions(inv, ctx) {
-  return {
-    from: parseDateBound2("from", getStringFlag(inv, "from"), false, ctx.now),
-    to: parseDateBound2("to", getStringFlag(inv, "to"), true, ctx.now),
-    limit: parseNumberFlag("limit", getStringFlag(inv, "limit"), {
-      integer: true,
-      positive: true
-    }),
-    order: parseEnumFlag("order", getStringFlag(inv, "order"), ["asc", "desc"]) ?? "desc"
-  };
-}
 var add2 = {
   path: ["mileage", "add"],
   summary: "\u6DFB\u52A0\u91CC\u7A0B\u8BB0\u5F55",
@@ -3955,7 +3949,7 @@ var add2 = {
       replayed: result.replayed
     };
     emitSuccess(ctx, inv.globals.json, data, (target, value) => {
-      renderWarnings(target, false, value.warnings);
+      writeWarnings(target, value.warnings);
       if (value.dry_run) {
         writeLine(target, `[\u9884\u89C8] \u91CC\u7A0B\u8BB0\u5F55: ${formatMileage(value.record.mileage)} @ ${value.record.datetime}`);
         renderUrgentReminders(target, value.reminders);
@@ -4024,7 +4018,7 @@ var update2 = {
       dry_run: result.dryRun
     };
     emitSuccess(ctx, inv.globals.json, data, (target, value) => {
-      renderWarnings(target, false, value.warnings);
+      writeWarnings(target, value.warnings);
       writeLine(target, `${value.dry_run ? "[\u9884\u89C8] " : ""}\u91CC\u7A0B\u8BB0\u5F55\u5DF2\u66F4\u65B0 (ID: ${value.record.id}): ` + `${formatMileage(value.record.mileage)} @ ${value.record.datetime}`);
       writeLine(target, `\u5F53\u524D\u91CC\u7A0B: ${formatMileage(value.current_mileage)}`);
     });
@@ -4095,42 +4089,6 @@ var mileageCommands = [
 ];
 
 // src/cli/commands/refuel.ts
-var STATUS_LABELS3 = {
-  overdue: "\u5DF2\u903E\u671F",
-  due_soon: "\u5373\u5C06\u5230\u671F",
-  ok: "\u6B63\u5E38",
-  unknown: "\u672A\u77E5"
-};
-function renderUrgentReminders2(ctx, reminders) {
-  for (const reminder of reminders) {
-    if (reminder.status !== "overdue" && reminder.status !== "due_soon")
-      continue;
-    const remaining = [];
-    if (reminder.remaining_km !== null) {
-      remaining.push(`${reminder.remaining_km.toLocaleString("zh-CN")} km`);
-    }
-    if (reminder.remaining_days !== null) {
-      remaining.push(`${reminder.remaining_days} \u5929`);
-    }
-    writeLine(ctx, `\u63D0\u9192: ${reminder.name} (${reminder.item}) ${STATUS_LABELS3[reminder.status]}` + (remaining.length > 0 ? `\uFF0C\u5269\u4F59 ${remaining.join(" / ")}` : ""));
-  }
-}
-function renderWarnings2(ctx, json, warnings) {
-  if (json)
-    return;
-  for (const warning3 of warnings) {
-    ctx.stderr(`\u8B66\u544A: ${warning3.message}
-`);
-  }
-}
-function parseDateBound3(flag, raw, endOfDay, now) {
-  if (raw === undefined)
-    return;
-  if (endOfDay && /^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    return `${raw} 23:59:59`;
-  }
-  return parseDatetimeFlag(flag, raw, now);
-}
 function resolveFullness(inv, vehicleTankCapacity) {
   const full = getBooleanFlag(inv, "full");
   const partial = getBooleanFlag(inv, "partial");
@@ -4181,16 +4139,6 @@ function distances(db, vehicleId, mileage, datetime, excludeId) {
   return {
     distance_since_last_refuel: previousRefuel?.mileage !== null && previousRefuel?.mileage !== undefined ? mileage - previousRefuel.mileage : null,
     distance_since_last_odometer: previousOdometer?.mileage !== null && previousOdometer?.mileage !== undefined ? mileage - previousOdometer.mileage : null
-  };
-}
-function fuelView(summary2) {
-  return {
-    latest_segment: summary2.latest_segment,
-    overall: summary2.overall,
-    pending: summary2.pending,
-    unmeasured_partials: summary2.unmeasured_partials,
-    warnings: summary2.warnings,
-    confidence: summary2.confidence
   };
 }
 function previewCurrentMileage(db, vehicleId, record, excludeId) {
@@ -4363,14 +4311,14 @@ var add3 = {
       record: recordToView(record, { preview: result.dryRun }),
       price_per_liter: record.cost !== null && record.liters !== null ? record.cost / record.liters : null,
       ...distance,
-      fuel: fuelView(fuel),
+      fuel: fuelOverview(fuel),
       reminders: getVehicleReminders(db, vehicle.id, { now: ctx.now }),
       warnings: result.warnings,
       dry_run: result.dryRun,
       replayed: result.replayed
     };
     emitSuccess(ctx, inv.globals.json, data, (target, value) => {
-      renderWarnings2(target, false, value.warnings);
+      writeWarnings(target, value.warnings);
       const label = value.record.is_full ? "\u52A0\u6EE1" : "\u672A\u52A0\u6EE1";
       writeLine(target, `${value.dry_run ? "[\u9884\u89C8] " : ""}\u52A0\u6CB9\u8BB0\u5F55\u5DF2\u4FDD\u5B58 (ID: ${value.record.id}): ` + `${value.record.liters} L / ${formatCurrency(value.record.cost ?? 0)} (${label})`);
       if (value.price_per_liter !== null) {
@@ -4383,7 +4331,7 @@ var add3 = {
         writeLine(target, `\u8DDD\u4E0A\u6B21\u91CC\u7A0B\u8BB0\u5F55: ${value.distance_since_last_odometer.toLocaleString("zh-CN")} km`);
       }
       renderFuelSummary(target, value.fuel);
-      renderUrgentReminders2(target, value.reminders);
+      renderUrgentReminders(target, value.reminders);
     });
   }
 };
@@ -4517,13 +4465,13 @@ var update3 = {
       vehicle: vehicleToView(db, vehicle),
       record: recordToView(record, { preview: result.dryRun }),
       price_per_liter: record.cost !== null && record.liters !== null ? record.cost / record.liters : null,
-      fuel: fuelView(fuel),
+      fuel: fuelOverview(fuel),
       reminders: null,
       warnings: result.warnings,
       dry_run: result.dryRun
     };
     emitSuccess(ctx, inv.globals.json, data, (target, value) => {
-      renderWarnings2(target, false, value.warnings);
+      writeWarnings(target, value.warnings);
       writeLine(target, `${value.dry_run ? "[\u9884\u89C8] " : ""}\u52A0\u6CB9\u8BB0\u5F55\u5DF2\u66F4\u65B0 (ID: ${value.record.id}): ` + `${value.record.liters} L / ${formatCurrency(value.record.cost ?? 0)}`);
       renderFuelSummary(target, value.fuel);
     });
@@ -4565,18 +4513,7 @@ var list3 = {
   handler: (ctx, inv) => {
     const db = getCliDb(ctx);
     const vehicle = resolveVehicle(db, getStringFlag(inv, "car"));
-    const records = listRefuelRecords(db, vehicle.id, {
-      from: parseDateBound3("from", getStringFlag(inv, "from"), false, ctx.now),
-      to: parseDateBound3("to", getStringFlag(inv, "to"), true, ctx.now),
-      limit: parseNumberFlag("limit", getStringFlag(inv, "limit"), {
-        integer: true,
-        positive: true
-      }),
-      order: parseEnumFlag("order", getStringFlag(inv, "order"), [
-        "asc",
-        "desc"
-      ]) ?? "desc"
-    });
+    const records = listRefuelRecords(db, vehicle.id, parseListOptions(inv, ctx));
     const data = {
       vehicle: vehicleToView(db, vehicle),
       records: records.map((record) => recordToView(record)),
@@ -4622,12 +4559,7 @@ var consumption = {
   handler: (ctx, inv) => {
     const db = getCliDb(ctx);
     const vehicle = resolveVehicle(db, getStringFlag(inv, "car"));
-    const from = parseDateBound3("from", getStringFlag(inv, "from"), false, ctx.now);
-    const to = parseDateBound3("to", getStringFlag(inv, "to"), true, ctx.now);
-    const limit = parseNumberFlag("limit", getStringFlag(inv, "limit"), {
-      integer: true,
-      positive: true
-    });
+    const { from, to, limit } = parseListOptions(inv, ctx);
     const summary2 = computeVehicleFuelSummary(db, vehicle.id, {
       currentMileage: getCurrentMileage(db, vehicle.id),
       tankCapacityL: vehicle.tank_capacity_l,
@@ -4717,11 +4649,6 @@ function duplicateError3(record) {
     }
   });
 }
-function shiftMinutes2(datetime, minutes) {
-  const base = new Date(datetime.replace(" ", "T"));
-  base.setMinutes(base.getMinutes() + minutes);
-  return formatNow(() => base);
-}
 function sameItemSet(db, recordId, targetIds) {
   const existing = getMaintenanceRecordItems(db, recordId).map((item) => item.id).sort((a, b) => a - b);
   const target = [...new Set(targetIds)].sort((a, b) => a - b);
@@ -4747,7 +4674,7 @@ function findMaintenanceDuplicate(db, input) {
     params.push(input.datetime);
   } else {
     conditions.push("datetime >= ?", "datetime <= ?");
-    params.push(shiftMinutes2(input.datetime, -DUPLICATE_WINDOW_MINUTES), input.datetime);
+    params.push(shiftMinutes(input.datetime, -DUPLICATE_WINDOW_MINUTES), input.datetime);
   }
   if (input.excludeId !== undefined) {
     conditions.push("id <> ?");
@@ -4970,15 +4897,15 @@ function updateMaintenanceRecord(db, id, patch, options = {}) {
   const recordPatch = { mileage, cost, datetime };
   if (patch.note !== undefined)
     recordPatch.note = patch.note;
+  let record;
   const tx = db.transaction(() => {
-    updateRecord(db, id, recordPatch, now);
+    record = updateRecord(db, id, recordPatch, now);
     if (patch.item_ids !== undefined) {
       db.query("DELETE FROM maintenance_record_items WHERE record_id = ?").run(id);
       insertLinks(db, id, items.map((item) => item.id));
     }
   });
   tx();
-  const record = getRecordById(db, id);
   return {
     record,
     items,
@@ -5033,28 +4960,6 @@ function daysBetween(from, to) {
 }
 
 // src/cli/commands/maintenance.ts
-function renderWarnings3(ctx, json, warnings) {
-  if (json)
-    return;
-  for (const warning3 of warnings) {
-    ctx.stderr(`\u8B66\u544A: ${warning3.message}
-`);
-  }
-}
-function parseDateBound4(flag, raw, endOfDay, now) {
-  if (raw === undefined)
-    return;
-  if (endOfDay && /^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    return `${raw} 23:59:59`;
-  }
-  return parseDatetimeFlag(flag, raw, now);
-}
-var STATUS_LABELS4 = {
-  overdue: "\u5DF2\u903E\u671F",
-  due_soon: "\u5373\u5C06\u5230\u671F",
-  ok: "\u6B63\u5E38",
-  unknown: "\u672A\u77E5"
-};
 var SOURCE_LABELS = {
   default: "\u76EE\u5F55\u9ED8\u8BA4",
   override: "\u672C\u8F66\u8986\u76D6",
@@ -5066,14 +4971,6 @@ function formatInterval(intervalKm, intervalMonths) {
     parts.push(`${intervalKm.toLocaleString("zh-CN")} km`);
   if (intervalMonths !== null)
     parts.push(`${intervalMonths} \u4E2A\u6708`);
-  return parts.length > 0 ? parts.join(" / ") : "-";
-}
-function formatDue(mileage, datetime) {
-  const parts = [];
-  if (mileage !== null)
-    parts.push(`${mileage.toLocaleString("zh-CN")} km`);
-  if (datetime !== null)
-    parts.push(datetime);
   return parts.length > 0 ? parts.join(" / ") : "-";
 }
 function formatRemaining(remainingKm, remainingDays) {
@@ -5088,7 +4985,7 @@ function formatRemaining(remainingKm, remainingDays) {
 function renderWriteReminders(ctx, reminders) {
   const urgent = reminders.filter((reminder) => reminder.status === "overdue" || reminder.status === "due_soon");
   for (const reminder of urgent) {
-    writeLine(ctx, `\u63D0\u9192: ${reminder.name} (${reminder.item}) ${STATUS_LABELS4[reminder.status]}` + `\uFF0C\u5269\u4F59 ${formatRemaining(reminder.remaining_km, reminder.remaining_days)}` + `\uFF0C\u4E0B\u6B21 ${formatDue(reminder.next_due_mileage, reminder.next_due_datetime)}`);
+    writeLine(ctx, `\u63D0\u9192: ${reminder.name} (${reminder.item}) ${REMINDER_STATUS_LABELS[reminder.status]}` + `\uFF0C\u5269\u4F59 ${formatRemaining(reminder.remaining_km, reminder.remaining_days)}` + `\uFF0C\u4E0B\u6B21 ${formatDue(reminder.next_due_mileage, reminder.next_due_datetime)}`);
   }
 }
 function hasFlag(inv, name) {
@@ -5133,7 +5030,7 @@ function renderRuleTable(ctx, rules) {
     formatDue(rule.baseline_mileage, rule.baseline_datetime),
     formatDue(rule.last_service_mileage, rule.last_service_datetime),
     formatDue(rule.next_due_mileage, rule.next_due_datetime),
-    STATUS_LABELS4[rule.status]
+    REMINDER_STATUS_LABELS[rule.status]
   ])));
 }
 function renderStatusReminders(ctx, reminders) {
@@ -5143,7 +5040,7 @@ function renderStatusReminders(ctx, reminders) {
   }
   writeLine(ctx, table(["\u9879\u76EE", "\u72B6\u6001", "\u4E0A\u6B21\u4FDD\u517B", "\u4E0B\u6B21\u5230\u671F", "\u5269\u4F59"], reminders.map((reminder) => [
     `${reminder.name} (${reminder.item})`,
-    STATUS_LABELS4[reminder.status],
+    REMINDER_STATUS_LABELS[reminder.status],
     formatDue(reminder.last_service_mileage, reminder.last_service_datetime),
     formatDue(reminder.next_due_mileage, reminder.next_due_datetime),
     formatRemaining(reminder.remaining_km, reminder.remaining_days)
@@ -5234,7 +5131,7 @@ var add4 = {
       replayed: result.replayed
     };
     emitSuccess(ctx, inv.globals.json, data, (target, value) => {
-      renderWarnings3(target, false, value.warnings);
+      writeWarnings(target, value.warnings);
       writeLine(target, `${value.dry_run ? "[\u9884\u89C8] " : ""}\u4FDD\u517B\u8BB0\u5F55\u5DF2\u4FDD\u5B58` + `${value.record.id === null ? "" : ` (ID: ${value.record.id})`}: ` + `${formatMileage(value.record.mileage)} @ ${value.record.datetime}` + `${value.record.cost !== null ? ` / ${formatCurrency(value.record.cost)}` : ""}`);
       if (value.items.length > 0) {
         writeLine(target, `\u9879\u76EE: ${value.items.map((item) => `${item.name} (${item.code})`).join("\u3001")}`);
@@ -5324,7 +5221,7 @@ var update4 = {
       dry_run: result.dryRun
     };
     emitSuccess(ctx, inv.globals.json, data, (target, value) => {
-      renderWarnings3(target, false, value.warnings);
+      writeWarnings(target, value.warnings);
       writeLine(target, `${value.dry_run ? "[\u9884\u89C8] " : ""}\u4FDD\u517B\u8BB0\u5F55\u5DF2\u66F4\u65B0` + `${value.record.id === null ? "" : ` (ID: ${value.record.id})`}: ` + `${formatMileage(value.record.mileage)} @ ${value.record.datetime}`);
       if (value.items.length > 0) {
         writeLine(target, `\u9879\u76EE: ${value.items.map((item) => `${item.name} (${item.code})`).join("\u3001")}`);
@@ -5369,18 +5266,7 @@ var list4 = {
   handler: (ctx, inv) => {
     const db = getCliDb(ctx);
     const vehicle = resolveVehicle(db, getStringFlag(inv, "car"));
-    const records = listMaintenanceRecords(db, vehicle.id, {
-      from: parseDateBound4("from", getStringFlag(inv, "from"), false, ctx.now),
-      to: parseDateBound4("to", getStringFlag(inv, "to"), true, ctx.now),
-      limit: parseNumberFlag("limit", getStringFlag(inv, "limit"), {
-        integer: true,
-        positive: true
-      }),
-      order: parseEnumFlag("order", getStringFlag(inv, "order"), [
-        "asc",
-        "desc"
-      ]) ?? "desc"
-    });
+    const records = listMaintenanceRecords(db, vehicle.id, parseListOptions(inv, ctx));
     const views = records.map((record) => ({
       ...recordToView(record),
       items: getMaintenanceRecordItems(db, record.id).map(itemToView)
@@ -5783,29 +5669,10 @@ var maintenanceCommands = [
 ];
 
 // src/cli/commands/remind.ts
-var STATUS_LABELS5 = {
-  overdue: "\u5DF2\u903E\u671F",
-  due_soon: "\u5373\u5C06\u5230\u671F",
-  ok: "\u6B63\u5E38",
-  unknown: "\u672A\u77E5"
-};
-function formatRemainingKm(value) {
-  if (value === null)
-    return "-";
-  return `${value.toLocaleString("zh-CN")} km`;
-}
 function formatRemainingDays(value) {
   if (value === null)
     return "-";
   return `${value} \u5929`;
-}
-function formatDue2(mileage, datetime) {
-  const parts = [];
-  if (mileage !== null)
-    parts.push(`${mileage.toLocaleString("zh-CN")} km`);
-  if (datetime !== null)
-    parts.push(datetime);
-  return parts.length > 0 ? parts.join(" / ") : "-";
 }
 var remind = {
   path: ["remind"],
@@ -5869,10 +5736,10 @@ var remind = {
       }
       writeLine(target, table(["\u9879\u76EE", "\u72B6\u6001", "\u5269\u4F59\u91CC\u7A0B", "\u5269\u4F59\u5929\u6570", "\u4E0B\u6B21\u5230\u671F"], data.reminders.map((reminder) => [
         `${reminder.name} (${reminder.item})`,
-        STATUS_LABELS5[reminder.status],
-        formatRemainingKm(reminder.remaining_km),
+        REMINDER_STATUS_LABELS[reminder.status],
+        formatMileage(reminder.remaining_km),
         formatRemainingDays(reminder.remaining_days),
-        formatDue2(reminder.next_due_mileage, reminder.next_due_datetime)
+        formatDue(reminder.next_due_mileage, reminder.next_due_datetime)
       ])));
       writeLine(target, `\u903E\u671F ${data.counts.overdue} \u9879\uFF0C\u5373\u5C06\u5230\u671F ${data.counts.due_soon} \u9879\uFF0C` + `\u6B63\u5E38 ${data.counts.ok} \u9879\uFF0C\u672A\u77E5 ${data.counts.unknown} \u9879`);
     });
@@ -5962,23 +5829,6 @@ function parsePeriodOptions(inv) {
     })
   };
 }
-function periodLabel(period) {
-  if (period.year !== null && period.month !== null) {
-    return `${period.year}\u5E74${period.month}\u6708`;
-  }
-  if (period.year !== null)
-    return `${period.year}\u5E74`;
-  if (period.from !== null || period.to !== null) {
-    return `${period.from ?? "\u6700\u65E9"} ~ ${period.to ?? "\u81F3\u4ECA"}`;
-  }
-  return "\u5168\u90E8\u65F6\u95F4";
-}
-function renderWarnings4(ctx, warnings) {
-  for (const warning3 of warnings) {
-    ctx.stderr(`\u8B66\u544A: ${warning3.message}
-`);
-  }
-}
 function renderTotals(ctx, totals) {
   writeLine(ctx, `\u603B\u8BA1: ${formatCurrency(totals.total)}` + `\uFF08\u71C3\u6CB9 ${formatCurrency(totals.fuel)} / \u4FDD\u517B ${formatCurrency(totals.maintenance)}` + ` / \u5176\u4ED6 ${formatCurrency(totals.other)}\uFF09`);
   if (totals.distance === null) {
@@ -6059,7 +5909,7 @@ var expenses = {
     });
     const data = { vehicle: vehicleToView(db, vehicle), ...stats };
     emitSuccess(ctx, inv.globals.json, data, (target, value) => {
-      renderWarnings4(target, value.warnings);
+      writeWarnings(target, value.warnings);
       writeLine(target, `\u8D39\u7528\u7EDF\u8BA1 (${periodLabel(value.period)}):`);
       renderTotals(target, value.totals);
       writeLine(target, "");
@@ -6106,7 +5956,7 @@ var fuel = {
     });
     const data = { vehicle: vehicleToView(db, vehicle), period, ...summary2 };
     emitSuccess(ctx, inv.globals.json, data, (target, value) => {
-      renderWarnings4(target, value.warnings);
+      writeWarnings(target, value.warnings);
       writeLine(target, `\u6CB9\u8017\u7EDF\u8BA1 (${periodLabel(value.period)}):`);
       if (value.segments.length === 0) {
         writeLine(target, "\u6CA1\u6709\u5DF2\u95ED\u5408\u7684\u52A0\u6EE1\u5230\u52A0\u6EE1\u5206\u6BB5\u3002");
@@ -6171,7 +6021,7 @@ var mileage = {
     });
     const data = { vehicle: vehicleToView(db, vehicle), ...stats };
     emitSuccess(ctx, inv.globals.json, data, (target, value) => {
-      renderWarnings4(target, value.warnings);
+      writeWarnings(target, value.warnings);
       writeLine(target, `\u91CC\u7A0B\u7EDF\u8BA1 (${periodLabel(value.period)}):`);
       if (value.distance === null) {
         writeLine(target, "\u8DDD\u79BB: \u672A\u77E5\uFF08\u7F3A\u5C11\u91CC\u7A0B\u57FA\u7EBF\uFF09");
@@ -6272,11 +6122,6 @@ function normalizeDatetime(value, now) {
     throw new DomainError("INVALID_ARGUMENT", `\u65F6\u95F4\u683C\u5F0F\u65E0\u6548\uFF1A\u300C${value ?? ""}\u300D\uFF0C\u8BF7\u4F7F\u7528 YYYY-MM-DD \u6216 YYYY-MM-DD HH:MM[:SS]`, { details: { field: "datetime", value: value ?? null } });
   }
 }
-function shiftMinutes3(datetime, minutes) {
-  const base = new Date(datetime.replace(" ", "T"));
-  base.setMinutes(base.getMinutes() + minutes);
-  return formatNow(() => base);
-}
 function duplicateError4(expense) {
   return new DomainError("DUPLICATE_RECORD", `\u68C0\u6D4B\u5230\u91CD\u590D\u7684\u6742\u8D39\u8BB0\u5F55 (ID: ${expense.id}, ${expense.datetime}, ` + `${expense.category}, ${expense.amount} \u5143)\uFF1B\u786E\u8BA4\u4E0D\u662F\u91CD\u590D\u63D0\u4EA4\u540E\u52A0 --force`, {
     details: {
@@ -6304,7 +6149,7 @@ function findDuplicateExpense(db, input) {
     params.push(input.datetime);
   } else {
     conditions.push("datetime >= ?", "datetime <= ?");
-    params.push(shiftMinutes3(input.datetime, -DUPLICATE_WINDOW_MINUTES), input.datetime);
+    params.push(shiftMinutes(input.datetime, -DUPLICATE_WINDOW_MINUTES), input.datetime);
   }
   if (input.excludeId !== undefined) {
     conditions.push("id <> ?");
@@ -6447,22 +6292,8 @@ function listExpenses(db, vehicleId, options = {}) {
 function allTimeTotals(db, vehicleId) {
   return computeExpenseStats(db, vehicleId).totals;
 }
-function renderWarnings5(ctx, warnings) {
-  for (const warning3 of warnings) {
-    ctx.stderr(`\u8B66\u544A: ${warning3.message}
-`);
-  }
-}
 function renderTotals2(ctx, totals) {
   writeLine(ctx, `\u672C\u671F\u5408\u8BA1: ${formatCurrency(totals.total)}` + `\uFF08\u71C3\u6CB9 ${formatCurrency(totals.fuel)} / \u4FDD\u517B ${formatCurrency(totals.maintenance)}` + ` / \u5176\u4ED6 ${formatCurrency(totals.other)}\uFF09`);
-}
-function parseDateBound5(flag, raw, endOfDay, now) {
-  if (raw === undefined)
-    return;
-  if (endOfDay && /^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    return `${raw} 23:59:59`;
-  }
-  return parseDatetimeFlag(flag, raw, now);
 }
 var add5 = {
   path: ["expense", "add"],
@@ -6534,7 +6365,7 @@ var add5 = {
       dry_run: result.dryRun
     };
     emitSuccess(ctx, inv.globals.json, data, (target, value) => {
-      renderWarnings5(target, value.warnings);
+      writeWarnings(target, value.warnings);
       writeLine(target, `${value.dry_run ? "[\u9884\u89C8] " : ""}\u6742\u8D39\u5DF2${value.dry_run ? "\u51C6\u5907" : "\u4FDD\u5B58"} (ID: ${value.expense.id ?? "-"}): ` + `${value.expense.category_label} ${formatCurrency(value.expense.amount)}` + ` (${value.expense.datetime})`);
       renderTotals2(target, value.totals);
     });
@@ -6561,12 +6392,7 @@ var list5 = {
     const db = getCliDb(ctx);
     const vehicle = resolveVehicle(db, getStringFlag(inv, "car"));
     const category = getStringFlag(inv, "category");
-    const from = parseDateBound5("from", getStringFlag(inv, "from"), false, ctx.now);
-    const to = parseDateBound5("to", getStringFlag(inv, "to"), true, ctx.now);
-    const limit = parseNumberFlag("limit", getStringFlag(inv, "limit"), {
-      integer: true,
-      positive: true
-    });
+    const { from, to, limit } = parseListOptions(inv, ctx);
     const expenses2 = listExpenses(db, vehicle.id, { category, from, to, limit });
     const data = {
       vehicle: vehicleToView(db, vehicle),
@@ -6645,7 +6471,7 @@ var update5 = {
       dry_run: result.dryRun
     };
     emitSuccess(ctx, inv.globals.json, data, (target, value) => {
-      renderWarnings5(target, value.warnings);
+      writeWarnings(target, value.warnings);
       writeLine(target, `${value.dry_run ? "[\u9884\u89C8] " : ""}\u6742\u8D39\u5DF2${value.dry_run ? "\u51C6\u5907\u66F4\u65B0" : "\u66F4\u65B0"} (ID: ${value.expense.id ?? "-"}): ` + `${value.expense.category_label} ${formatCurrency(value.expense.amount)}`);
       renderTotals2(target, value.totals);
     });
@@ -6694,11 +6520,6 @@ var expenseCommands = [
 
 // src/cli/commands/delete-all.ts
 var RECORD_TYPES = ["mileage", "refuel", "maintenance"];
-var TYPE_LABELS = {
-  mileage: "\u91CC\u7A0B",
-  refuel: "\u52A0\u6CB9",
-  maintenance: "\u4FDD\u517B"
-};
 var deleteAll = {
   path: ["delete-all"],
   summary: "\u6279\u91CF\u5220\u9664\u67D0\u8F86\u8F66\u7684\u8BB0\u5F55\uFF08\u9700\u8981 --yes\uFF09",
@@ -6730,7 +6551,7 @@ var deleteAll = {
          WHERE vehicle_id = ? AND deleted = 0` + (recordType === undefined ? "" : " AND record_type = ?")).get(...recordType === undefined ? [vehicle.id] : [vehicle.id, recordType]);
     const count = countRow?.count ?? 0;
     if (count > 0 && !yes) {
-      throw new AppError("INVALID_ARGUMENT", `\u8F66\u8F86\u300C${vehicle.name}\u300D\u8FD8\u6709 ${count} \u6761${recordType === undefined ? "" : TYPE_LABELS[recordType]}\u8BB0\u5F55\uFF0C\u8BF7\u52A0 --yes \u786E\u8BA4\u6279\u91CF\u5220\u9664`, {
+      throw new AppError("INVALID_ARGUMENT", `\u8F66\u8F86\u300C${vehicle.name}\u300D\u8FD8\u6709 ${count} \u6761${recordType === undefined ? "" : RECORD_TYPE_LABELS[recordType]}\u8BB0\u5F55\uFF0C\u8BF7\u52A0 --yes \u786E\u8BA4\u6279\u91CF\u5220\u9664`, {
         hint: "\u6279\u91CF\u5220\u9664\u524D\u8BF7\u52A0 --yes \u786E\u8BA4",
         details: {
           vehicle_id: vehicle.id,
@@ -6755,7 +6576,7 @@ var deleteAll = {
         writeLine(target, "\u6CA1\u6709\u9700\u8981\u5220\u9664\u7684\u8BB0\u5F55");
         return;
       }
-      writeLine(target, `\u5DF2\u5220\u9664 ${value.deleted_count} \u6761${value.record_type === null ? "" : TYPE_LABELS[value.record_type]}\u8BB0\u5F55 (\u8F66\u8F86: ${vehicle.name})`);
+      writeLine(target, `\u5DF2\u5220\u9664 ${value.deleted_count} \u6761${value.record_type === null ? "" : RECORD_TYPE_LABELS[value.record_type]}\u8BB0\u5F55 (\u8F66\u8F86: ${vehicle.name})`);
     });
   }
 };
@@ -7300,6 +7121,9 @@ function assertUnique(rows, keyOf, label) {
     seen.add(key);
   }
 }
+function sameVehicle(target, row) {
+  return target.name === row.name && target.plate === row.plate && target.tank_capacity_l === row.tank_capacity_l && target.initial_mileage === row.initial_mileage && target.initial_datetime === row.initial_datetime && target.deleted === row.deleted;
+}
 function sameItem(target, row) {
   return target.code === row.code && target.name === row.name && target.aliases === row.aliases && target.category === row.category && target.default_interval_km === row.default_interval_km && target.default_interval_months === row.default_interval_months && target.description === row.description && target.is_active === row.is_active;
 }
@@ -7360,6 +7184,27 @@ function importDocument(db, raw, options = {}) {
             entity: "vehicle",
             export_vehicle_id: row.id,
             target_vehicle_id: candidate.id
+          });
+        }
+        if (!replace && !sameVehicle(candidate, row)) {
+          conflict(`\u8F66\u8F86\u300C${row.name}\u300D\u4E0E\u76EE\u6807\u5E93\u8F66\u8F86 ID ${candidate.id} \u7684\u8EAB\u4EFD\u76F8\u540C\u4F46\u6863\u6848\u5C5E\u6027\u4E0D\u540C`, {
+            entity: "vehicle",
+            export_vehicle_id: row.id,
+            target_vehicle_id: candidate.id,
+            name: row.name,
+            plate: row.plate,
+            target: {
+              tank_capacity_l: candidate.tank_capacity_l,
+              initial_mileage: candidate.initial_mileage,
+              initial_datetime: candidate.initial_datetime,
+              deleted: candidate.deleted
+            },
+            incoming: {
+              tank_capacity_l: row.tank_capacity_l,
+              initial_mileage: row.initial_mileage,
+              initial_datetime: row.initial_datetime,
+              deleted: row.deleted
+            }
           });
         }
         claimedVehicleIds.add(candidate.id);
@@ -7695,11 +7540,6 @@ var importCommand = {
 var importCommands = [importCommand];
 
 // src/doctor.ts
-var TYPE_LABELS2 = {
-  mileage: "\u91CC\u7A0B",
-  refuel: "\u52A0\u6CB9",
-  maintenance: "\u4FDD\u517B"
-};
 function formatKm2(value) {
   return value === null ? "-" : value.toLocaleString("zh-CN");
 }
@@ -7735,13 +7575,13 @@ function runDoctor(db, options = {}) {
         push("REFUEL_MISSING_MILEAGE", "error", `\u52A0\u6CB9\u8BB0\u5F55 ${record.id} \u7F3A\u5C11\u91CC\u7A0B\uFF0C\u6CB9\u8017\u5206\u6BB5\u65E0\u6CD5\u8BA1\u7B97`, recordEntity(record), `refuel update ${record.id} --mileage KM`);
       }
     } else if (record.mileage === null) {
-      push("RECORD_MISSING_MILEAGE", "error", `${TYPE_LABELS2[record.record_type] ?? record.record_type}\u8BB0\u5F55 ${record.id} \u7F3A\u5C11\u91CC\u7A0B`, recordEntity(record), `${record.record_type} update ${record.id} --mileage KM`);
+      push("RECORD_MISSING_MILEAGE", "error", `${RECORD_TYPE_LABELS[record.record_type]}\u8BB0\u5F55 ${record.id} \u7F3A\u5C11\u91CC\u7A0B`, recordEntity(record), `${record.record_type} update ${record.id} --mileage KM`);
     }
     if (record.mileage !== null && record.mileage <= 0) {
       push("NON_POSITIVE_MILEAGE", "error", `\u8BB0\u5F55 ${record.id} \u7684\u91CC\u7A0B\u4E3A ${formatKm2(record.mileage)} km\uFF0C\u5FC5\u987B\u5927\u4E8E 0`, recordEntity(record), `${record.record_type} update ${record.id} --mileage KM`);
     }
     if (record.cost !== null && record.cost < 0) {
-      push("NEGATIVE_COST", "error", `${TYPE_LABELS2[record.record_type] ?? record.record_type}\u8BB0\u5F55 ${record.id} \u7684\u91D1\u989D\u4E3A\u8D1F\u6570\uFF08${record.cost}\uFF09`, recordEntity(record), `${record.record_type} update ${record.id} --cost YUAN`);
+      push("NEGATIVE_COST", "error", `${RECORD_TYPE_LABELS[record.record_type]}\u8BB0\u5F55 ${record.id} \u7684\u91D1\u989D\u4E3A\u8D1F\u6570\uFF08${record.cost}\uFF09`, recordEntity(record), `${record.record_type} update ${record.id} --cost YUAN`);
     }
   }
   const ordered = db.query(`SELECT * FROM records
@@ -7875,7 +7715,7 @@ function runDoctor(db, options = {}) {
        HAVING COUNT(*) > 1
        ORDER BY vehicle_id ASC, datetime ASC`).all(...vehicleParams);
   for (const group of duplicateGroups) {
-    push("DUPLICATE_RECORDS", "warning", `\u8F66\u8F86 ${group.vehicle_id} \u6709 ${group.count} \u6761\u76F8\u540C\u7684${TYPE_LABELS2[group.record_type] ?? group.record_type}` + `\u8BB0\u5F55\uFF08${group.datetime}\uFF0CID: ${group.ids}\uFF09`, {
+    push("DUPLICATE_RECORDS", "warning", `\u8F66\u8F86 ${group.vehicle_id} \u6709 ${group.count} \u6761\u76F8\u540C\u7684${RECORD_TYPE_LABELS[group.record_type]}` + `\u8BB0\u5F55\uFF08${group.datetime}\uFF0CID: ${group.ids}\uFF09`, {
       type: "record_group",
       vehicle_id: group.vehicle_id,
       record_type: group.record_type,
@@ -8035,7 +7875,7 @@ function renderUsage(ctx) {
   writeLine(ctx, lines.join(`
 `));
 }
-function renderCommandHelp(ctx, spec, data) {
+function renderCommandHelp(ctx, data) {
   const lines = [`carlog ${data.path}`, "", data.summary, "", "\u7528\u6CD5:", `  ${data.usage}`];
   if (data.flags.length > 0) {
     lines.push("", "\u53C2\u6570:");
@@ -8108,7 +7948,7 @@ var help = {
     if (inv.globals.json) {
       emitSuccess(ctx, true, { commands: [helpData(spec)] });
     } else {
-      renderCommandHelp(ctx, spec, helpData(spec));
+      renderCommandHelp(ctx, helpData(spec));
     }
   }
 };
