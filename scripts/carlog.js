@@ -2094,7 +2094,14 @@ function computeReminder(input) {
   const kmAnchor = input.last_service?.mileage ?? input.rule?.baseline_mileage ?? input.vehicle_initial_mileage ?? null;
   const dateAnchor = input.last_service?.datetime ?? input.rule?.baseline_datetime ?? input.vehicle_initial_datetime ?? null;
   const nextDueMileage = intervalKm !== null && kmAnchor !== null ? kmAnchor + intervalKm : null;
-  const nextDueDatetime = intervalMonths !== null && dateAnchor !== null ? addMonths(dateAnchor, intervalMonths) : null;
+  let nextDueDatetime = null;
+  if (intervalMonths !== null && dateAnchor !== null) {
+    try {
+      nextDueDatetime = addMonths(dateAnchor, intervalMonths);
+    } catch {
+      nextDueDatetime = null;
+    }
+  }
   const remainingKm = nextDueMileage !== null && input.current_mileage !== null ? nextDueMileage - input.current_mileage : null;
   const remainingDays = nextDueDatetime !== null ? calendarDaysBetween(input.today, dateOf(nextDueDatetime)) : null;
   let status;
@@ -8019,6 +8026,54 @@ function runDoctor(db, options = {}) {
     push("FUTURE_MAINTENANCE", "warning", `\u4FDD\u517B\u8BB0\u5F55 ${record.id} \u7684\u65E5\u671F ${record.datetime} \u665A\u4E8E\u4ECA\u5929 ${today}\uFF0C\u4E0D\u4F1A\u4F5C\u4E3A\u63D0\u9192\u951A\u70B9`, recordEntity(record), `maintenance update ${record.id} --datetime ${today}`);
   }
   const vehicles = vehicleId === undefined ? db.query("SELECT * FROM vehicles WHERE deleted = 0 ORDER BY id ASC").all() : db.query("SELECT * FROM vehicles WHERE id = ? AND deleted = 0").all(vehicleId);
+  const isValidStoredDatetime = (value) => {
+    const trimmed = value.trim();
+    if (trimmed === "")
+      return false;
+    try {
+      parseDatetime(trimmed, () => new Date);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  for (const vehicle of vehicles) {
+    if (vehicle.initial_datetime !== null && !isValidStoredDatetime(vehicle.initial_datetime)) {
+      push("INVALID_DATETIME", "error", `\u8F66\u8F86 ${vehicle.id}\uFF08${vehicle.name}\uFF09\u7684\u521D\u59CB\u65E5\u671F\u300C${vehicle.initial_datetime}\u300D\u65E0\u6CD5\u89E3\u6790\uFF0C\u65F6\u95F4\u63D0\u9192\u4F1A\u964D\u7EA7\u4E3A\u672A\u77E5`, { type: "vehicle", vehicle_id: vehicle.id, vehicle_name: vehicle.name }, `car update ${vehicle.id} --initial-date ${today}`);
+    }
+  }
+  const allRules = db.query(`SELECT r.id, r.vehicle_id, mi.code AS item_code, r.baseline_datetime
+       FROM vehicle_maintenance_rules r
+       JOIN maintenance_items mi ON mi.id = r.item_id`).all();
+  for (const row of allRules) {
+    if (vehicleId !== undefined && row.vehicle_id !== vehicleId)
+      continue;
+    if (row.baseline_datetime !== null && !isValidStoredDatetime(row.baseline_datetime)) {
+      push("INVALID_DATETIME", "error", `\u4FDD\u517B\u89C4\u5219 ${row.id}\uFF08\u9879\u76EE ${row.item_code}\uFF09\u7684\u57FA\u7EBF\u65E5\u671F\u300C${row.baseline_datetime}\u300D\u65E0\u6CD5\u89E3\u6790`, {
+        type: "maintenance_rule",
+        rule_id: row.id,
+        vehicle_id: row.vehicle_id,
+        item: row.item_code
+      }, `maintenance rule list --car ${row.vehicle_id}`);
+    }
+  }
+  const allRecordsForDates = db.query("SELECT * FROM records WHERE deleted = 0 ORDER BY id ASC").all();
+  for (const record of allRecordsForDates) {
+    if (vehicleId !== undefined && record.vehicle_id !== vehicleId)
+      continue;
+    if (!isValidStoredDatetime(record.datetime)) {
+      const type = record.record_type;
+      push("INVALID_DATETIME", "error", `${RECORD_TYPE_LABELS[type]}\u8BB0\u5F55 ${record.id} \u7684\u65E5\u671F\u300C${record.datetime}\u300D\u65E0\u6CD5\u89E3\u6790`, recordEntity(record), `${type} update ${record.id} --datetime ${today}`);
+    }
+  }
+  const allExpensesForDates = db.query("SELECT id, vehicle_id, datetime FROM expenses WHERE deleted = 0 ORDER BY id ASC").all();
+  for (const expense of allExpensesForDates) {
+    if (vehicleId !== undefined && expense.vehicle_id !== vehicleId)
+      continue;
+    if (!isValidStoredDatetime(expense.datetime)) {
+      push("INVALID_DATETIME", "error", `\u6742\u8D39\u8BB0\u5F55 ${expense.id} \u7684\u65E5\u671F\u300C${expense.datetime}\u300D\u65E0\u6CD5\u89E3\u6790`, { type: "expense", expense_id: expense.id, vehicle_id: expense.vehicle_id }, `expense update ${expense.id} --datetime ${today}`);
+    }
+  }
   for (const vehicle of vehicles) {
     let reminders;
     try {
