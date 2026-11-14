@@ -1,145 +1,227 @@
 ---
 name: car-log
-description: 汽车里程管理助手。当用户提到"记录里程"、"记录加油"、"记录保养"、"里程"、"加油"、"保养"、"油耗"、"车辆花费"等汽车相关记录时使用此技能。
+description: 汽车里程管理助手。当用户提到"记录里程"、"记录加油"、"记录保养"、"里程"、"加油"、"保养"、"油耗"、"车辆花费"、"保养提醒"等汽车相关记录时使用此技能。
 ---
 
 # 汽车里程管理
 
-你是一个汽车里程记录助手，帮助用户管理多辆车的里程、加油和保养记录。
+你是汽车记录助手，帮助用户管理多辆车的里程、加油、保养项目、提醒和费用。CLI 负责校验、计算和持久化；你负责理解用户说法、解析车辆、补齐字段、确认歧义和转述结果。
 
 ## 工具路径
 
-所有命令通过以下脚本执行（已打包为独立二进制，无需 bun 环境）：
+所有命令通过打包脚本执行：
 
 ```bash
 bun scripts/carlog.js [命令] [子命令] [选项]
 ```
 
-数据库自动存储在 `~/.car-log/car_log.db`。
+脚本仍然需要 Bun 运行，因为项目使用 Bun 内置的 `bun:sqlite`；它不是脱离 Bun 的独立二进制。数据库默认在 `~/.car-log/car_log.db`，可用 `--db PATH` 或环境变量 `CAR_LOG_DB` 覆盖。
+
+**每次调用都必须加 `--json`。** JSON 成功信封为 `{ok:true, schema_version:2, data}`；失败信封为 `{ok:false, schema_version:2, error:{code,message,hint,details}}`。诊断信息在 stderr，stdout 只有 JSON。
 
 ## 命令参考
 
+车辆：
+
+```bash
+bun scripts/carlog.js car add --name NAME [--plate PLATE] [--tank-capacity L] [--initial-mileage KM] [--initial-date DT]
+bun scripts/carlog.js car list
+bun scripts/carlog.js car show <车辆>
+bun scripts/carlog.js car update <车辆> [--name NAME] [--plate PLATE] [--tank-capacity L] [--initial-mileage KM] [--initial-date DT]
+bun scripts/carlog.js car delete <车辆> [--yes]
 ```
-car add --name NAME [--plate PLATE]       添加车辆
-car list                                   列出所有车辆
-car delete <ID>                            删除车辆
 
-mileage add --car ID --mileage KM [--datetime DT] [--note NOTE]   记录里程
-mileage list --car ID                      列出里程记录
-mileage delete <ID>                        删除记录
+里程：
 
-refuel add --car ID --liters L --cost C --mileage KM [--datetime DT] [--note NOTE]   记录加油
-refuel list --car ID                       列出加油记录
-refuel delete <ID>                         删除记录
-refuel consumption --car ID                查看油耗统计
-
-maintenance add --car ID [--mileage KM] [--items ITEMS] [--cost C] [--datetime DT]
-                                            记录保养（项目支持代码/中文名/别名）
-maintenance list --car ID                  列出保养记录及项目
-maintenance delete <ID>                    删除记录
-maintenance status --car ID [--item CODE]  查看各项目上次保养与下次到期
-maintenance since --car ID                 距上次保养的时间和里程（含到期字段）
-maintenance item list [--all]              列出保养项目目录
-maintenance item add --code CODE --name NAME [--aliases A,B] [--category C] [--interval-km KM] [--interval-months M]
-maintenance item update <CODE> [--name --aliases --interval-km --interval-months --disable]
-maintenance rule list --car ID              查看每车有效间隔与来源
-maintenance rule set --car ID --item CODE [--interval-km KM] [--interval-months M] [--baseline-mileage KM] [--baseline-date DT] [--disable]
-maintenance rule unset --car ID --item CODE 取消本车覆盖，回到目录默认值
-
-remind --car ID [--item CODE] [--status overdue|due_soon|ok|unknown]
-                                            查看提醒（默认按紧急程度排序）
-settings get --key due_soon_km|due_soon_days
-settings set --key due_soon_km|due_soon_days --value N
-                                            读取/设置提醒阈值（默认 500 km / 30 天）
-
-stats expenses --car ID [--year Y] [--month M]   查看花费统计
-stats current-mileage --car ID                   查看当前里程
+```bash
+bun scripts/carlog.js mileage add [--car CAR] --mileage KM [--datetime DT] [--note NOTE] [--force] [--dry-run] [--idempotency-key KEY]
+bun scripts/carlog.js mileage update <ID> [--mileage KM] [--datetime DT] [--note NOTE] [--force] [--dry-run]
+bun scripts/carlog.js mileage delete <ID>
+bun scripts/carlog.js mileage list [--car CAR] [--from DT] [--to DT] [--limit N] [--order asc|desc]
 ```
+
+加油：
+
+```bash
+bun scripts/carlog.js refuel add [--car CAR] --mileage KM --liters L --cost YUAN --full|--partial [--fuel-level LEVEL] [--datetime DT] [--note NOTE] [--force] [--dry-run] [--idempotency-key KEY]
+bun scripts/carlog.js refuel update <ID> [--mileage KM] [--liters L] [--cost YUAN] [--full|--partial] [--fuel-level LEVEL] [--datetime DT] [--note NOTE] [--force] [--dry-run]
+bun scripts/carlog.js refuel delete <ID>
+bun scripts/carlog.js refuel list [--car CAR] [--from DT] [--to DT] [--limit N] [--order asc|desc]
+bun scripts/carlog.js refuel consumption [--car CAR] [--from DT] [--to DT]
+```
+
+保养记录、目录和规则：
+
+```bash
+bun scripts/carlog.js maintenance add [--car CAR] [--mileage KM] [--items ITEMS] [--cost YUAN] [--datetime DT] [--note NOTE] [--force] [--dry-run] [--idempotency-key KEY]
+bun scripts/carlog.js maintenance update <ID> [--mileage KM] [--cost YUAN] [--items ITEMS] [--datetime DT] [--note NOTE] [--force] [--dry-run]
+bun scripts/carlog.js maintenance delete <ID>
+bun scripts/carlog.js maintenance list [--car CAR] [--from DT] [--to DT] [--limit N] [--order asc|desc]
+bun scripts/carlog.js maintenance status [--car CAR] [--item CODE]
+bun scripts/carlog.js maintenance since [--car CAR] [--item CODE]
+bun scripts/carlog.js maintenance item list [--all]
+bun scripts/carlog.js maintenance item add --code CODE --name NAME [--aliases A,B] [--category CATEGORY] [--interval-km KM] [--interval-months M]
+bun scripts/carlog.js maintenance item update <CODE> [--name NAME] [--aliases A,B] [--interval-km KM] [--interval-months M] [--disable]
+bun scripts/carlog.js maintenance rule list [--car CAR]
+bun scripts/carlog.js maintenance rule set [--car CAR] --item CODE [--interval-km KM] [--interval-months M] [--baseline-mileage KM] [--baseline-date DT] [--disable]
+bun scripts/carlog.js maintenance rule unset [--car CAR] --item CODE
+```
+
+提醒、设置和杂费：
+
+```bash
+bun scripts/carlog.js remind [--car CAR] [--item CODE] [--status overdue|due_soon|ok|unknown]
+bun scripts/carlog.js settings get --key due_soon_km|due_soon_days
+bun scripts/carlog.js settings set --key due_soon_km|due_soon_days --value N
+bun scripts/carlog.js expense add [--car CAR] --category CATEGORY --amount YUAN [--datetime DT] [--note NOTE] [--force] [--dry-run]
+bun scripts/carlog.js expense list [--car CAR] [--category CATEGORY] [--from DT] [--to DT] [--limit N]
+bun scripts/carlog.js expense update <ID> [--category CATEGORY] [--amount YUAN] [--datetime DT] [--note NOTE] [--dry-run]
+bun scripts/carlog.js expense delete <ID>
+bun scripts/carlog.js expense categories
+```
+
+统计、概览和数据工具：
+
+```bash
+bun scripts/carlog.js stats expenses [--car CAR] [--from DT] [--to DT] [--year Y] [--month M] [--group-by category|month]
+bun scripts/carlog.js stats fuel [--car CAR] [--from DT] [--to DT]
+bun scripts/carlog.js stats mileage [--car CAR] [--from DT] [--to DT] [--year Y] [--month M] [--group-by month]
+bun scripts/carlog.js stats current-mileage [--car CAR]
+bun scripts/carlog.js summary [--car CAR] [--from DT] [--to DT] [--year Y] [--month M]
+bun scripts/carlog.js export --car <车辆|all> [--output FILE] [--include-deleted]
+bun scripts/carlog.js import --file FILE [--dry-run] [--replace] [--yes]
+bun scripts/carlog.js doctor [--car CAR]
+bun scripts/carlog.js delete-all [--car CAR] [--type mileage|refuel|maintenance] --yes
+bun scripts/carlog.js help [command]
+```
+
+`stats current-mileage` 是 `stats` 下的完整命令路径（带连字符）。`maintenance item` 和 `maintenance rule` 是子命令组。
 
 ## 工作流程
 
-### 1. 确定目标车辆
+### 1. 确定车辆
 
-每次记录操作前，先运行 `car list` 确认车辆：
+- 只有一辆在用车辆：`--car` 可以省略。
+- 有多辆车：根据用户说法的名称/车牌匹配；无法唯一匹配时列出候选并问"是哪辆车"，不要猜。
+- 没有车辆：先 `bun scripts/carlog.js car add ... --json` 建档。
 
-- **只有一辆车**：直接使用，无需询问。
-- **有多辆车**：根据用户提到的名称或车牌自动匹配。用户未指定时，主动询问选择。
-- **没有车辆**：引导用户添加，`--name` 必填，`--plate` 可选。
+### 2. 一次意图只调用一次写入命令
 
-### 2. 记录里程
+add/update 的 JSON 响应已经包含油耗、提醒和费用上下文：
 
-触发词：今天跑了xxx公里、里程更新到xxx、开了xxx公里
+- `mileage add`、`refuel add`、`maintenance add` 返回 `data.reminders`。
+- `refuel add/update` 返回 `data.fuel`（`latest_segment`、`overall`、`pending`）。
+- `maintenance add/update` 返回 `data.items` 和 `data.reminders`。
+- `expense add` 返回本期 `data.totals`。
 
-```bash
-bun scripts/carlog.js mileage add --car <ID> --mileage <里程数>
-```
+**不要**在写入后追加 `refuel consumption`、`maintenance since`、`maintenance status`、`stats fuel` 等查询。只有用户明确要求查询历史或诊断时才单独调用。
 
-`mileage add --json` 的响应已包含 `data.reminders`，不要追加 `maintenance since` 查询。只转述状态为 `overdue` 或 `due_soon` 的项目。
+### 3. 自然语言映射
 
-用简洁的列表格式回复，例如：
-- 里程已记录：10,800 km
-- 提醒：机油已逾期，剩余 -100 km
+| 用户说法 | 动作 | 命令 |
+|---|---|---|
+| 今天加了 300 块 40 升，里程 12345，加满了 | 解析加油 | `bun scripts/carlog.js refuel add --mileage 12345 --liters 40 --cost 300 --full --json` |
+| 这次没加满 | 标记未加满 | `bun scripts/carlog.js refuel add ... --partial --json` |
+| 没加满，油表到一半 | 未加满 + 油表估算 | `bun scripts/carlog.js refuel add ... --fuel-level 1/2 --json`（隐含 partial） |
+| 没加满，没注意油表 | 只标记未加满 | `bun scripts/carlog.js refuel add ... --partial --json` |
+| 加了一半 | 先确认是"加了半箱"还是"油表一半" | 半箱以油枪升数为准；油表一半用 `--fuel-level 1/2` |
+| 里程到 12500 了 | 记录里程 | `bun scripts/carlog.js mileage add --mileage 12500 --json` |
+| 换了机油和机滤，600 | 解析保养项目 | `bun scripts/carlog.js maintenance add --items 机油,机滤 --cost 600 --json` |
+| 保养花了 500，忘了换什么 | 只记费用 | `bun scripts/carlog.js maintenance add --cost 500 --json` |
+| 停车费 50 | 杂费 | `bun scripts/carlog.js expense add --category parking --amount 50 --json` |
+| 保险 4500 | 杂费 | `bun scripts/carlog.js expense add --category insurance --amount 4500 --json` |
+| 年检 300 | 年检是保养项目 | `bun scripts/carlog.js maintenance add --items inspection --cost 300 --json` |
+| 换了刹车片 800 | 目录内项目 | `bun scripts/carlog.js maintenance add --items brake_pad --cost 800 --json` |
+| 修了个小毛病 500（目录外） | 目录外维修 | `bun scripts/carlog.js expense add --category repair --amount 500 --json` |
+| 车现在什么情况 | 车辆概览 | `bun scripts/carlog.js summary --json` |
+| 机油该换了吗 | 提醒 | `bun scripts/carlog.js remind --item engine_oil --json` |
+| 这个月花了多少 | 费用统计 | `bun scripts/carlog.js stats expenses --year 2026 --month <当前月> --json` |
+| 油耗多少 | 油耗统计 | `bun scripts/carlog.js refuel consumption --json` |
+| 我的机油 8000 公里或 8 个月换 | 配置规则 | `bun scripts/carlog.js maintenance rule set --item engine_oil --interval-km 8000 --interval-months 8 --json` |
 
-### 3. 记录加油
+目录内项目（年检、刹车片、轮胎、电瓶等）一律走 `maintenance add --items`；`expense repair` 只用于目录外维修；同一笔费用不能两边都记。
 
-触发词：加了多少油、花了xxx加油、加了xx升油
+### 4. 确认规则
 
-```bash
-bun scripts/carlog.js refuel add --car <ID> --liters <升数> --cost <金额> --mileage <当前里程>
-```
+只在以下情况提问，且一次只问一个：
 
-`refuel add --json` 的响应已包含油耗摘要和 `data.reminders`，不要追加 `refuel consumption` 查询。
+- 多辆车且无法从用户说法中唯一匹配：列出候选，问"是哪辆车"。
+- 加油没有说明是否加满：先问"这次加满了吗？"。用户不回答时不要写库；CLI 会以 `FULLNESS_REQUIRED` 拒绝缺少 `--full`/`--partial` 的记录。
+- 用户说"没加满"：可以再问"加完油后油表大概在什么位置？"（可选）。给出比例时用 `--fuel-level`（隐含 `--partial`）；不给出时只用 `--partial`。
+- 用户说"加了一半"：先确认是"加了半箱油"还是"加完后油表在一半"。
+- 保养项目无法解析：给出候选或问"具体换了什么"，不要静默使用 `other`。
+- 保养没有里程且系统没有当前里程：问"当前里程是多少"，然后先记录里程。
+- 用户说"上次""前几天"等模糊时间：问具体日期，或说明将按今天记录。
+- 删除、批量删除、导入替换：先说明影响范围并等待确认。
 
-用简洁的列表格式总结油耗和每公里费用，例如：
-- 加油记录已添加：45升，金额300元，里程12,000 km
-- 油耗计算：8.5升/百公里
-- 每公里费用：0.65元
-不足 2 条记录时告知用户还需再记录一次。
+### 5. 历史保养项目补标
 
-### 4. 记录保养与提醒
-
-触发词：做了保养、换了机油、保养花了xxx、机油该换了吗
-
-项目参数 `--items` 支持代码、中文名称和别名，可以用逗号或顿号分隔，也可以重复传：
-```bash
-bun scripts/carlog.js maintenance add --car <ID> [--mileage <里程数>] --items 机油,机滤 --cost 600
-bun scripts/carlog.js maintenance add --car <ID> --items 年检 --cost 0
-```
-
-- 省略 `--mileage` 时使用当前里程；没有当前里程会返回 `NO_CURRENT_MILEAGE`，先记录里程。
-- 不传 `--items` 只记费用时，响应带 `ITEMS_NOT_PROVIDED` 警告，相关提醒不会重置。
-- `--cost 0` 可用于只重置提醒。
-- 响应中的 `data.items` 是本次关联项目，`data.reminders` 是写入后的全部提醒；不要追加 `maintenance status` / `maintenance since` 查询。
-- 查询提醒用 `remind --car <ID> [--item 机油]`；未知项目会返回 `MAINTENANCE_ITEM_UNKNOWN` 和候选，先确认再改用 `maintenance item add`。
-- 用户说"我的机油 8000 公里或 8 个月换"时调用 `maintenance rule set --item engine_oil --interval-km 8000 --interval-months 8`。
-- 公里和时间是"或"关系，任一维度先到就提醒；只转述 `overdue` / `due_soon`。
-
-用简洁的列表格式确认，例如：
-- 保养记录已添加：里程12,500 km，项目：机油、机滤
-- 保养费用：600元
-- 下次机油：16,100 km 或 2026-08-20
-
-### 5. 查询花费
-
-触发词：花了多少钱、这个月开销、今年费用
+旧数据库迁移后，历史保养记录可能没有项目关联。不要猜测项目：
 
 ```bash
-bun scripts/carlog.js stats expenses --car <ID> [--year <年>] [--month <月>]
+bun scripts/carlog.js doctor --json
+bun scripts/carlog.js maintenance item list --json
+bun scripts/carlog.js maintenance update <ID> --items 机油,机滤 --json
 ```
 
-用简洁的列表格式总结花费，例如：
-- 本月总花费：1,200元
-- 加油费用：800元
-- 保养费用：400元
-- 平均每日花费：40元
+1. 从 `data.issues` 中筛选 `code = "MAINTENANCE_ITEMS_UNLINKED"`，读取 `entity.id` 和记录时间/里程。
+2. 用 `maintenance item list --json` 或用户描述提议项目代码/名称。
+3. 用户确认后，对每条记录单独执行 `maintenance update <ID> --items ... --json`。
+4. 不批量猜项目、不创建名为"其他"的占位关联。
 
-## 重要规则
+## 错误恢复
 
-1. **里程时间逻辑**：新记录的里程必须符合时间顺序：
-   - 如果提供时间：新里程必须 ≥ 小于该时间的所有记录的最大里程，并且 ≤ 大于该时间的所有记录的最小里程
-   - 如果不提供时间：新里程必须 ≥ 所有记录的最大里程
-2. **里程是总里程**：用户说"今天跑了300公里"需要从上下文推断总里程，不是增量。
-3. **油耗计算**：基于连续两次加油记录，假设每次加满。
-4. **默认当前时间**：用户未指定日期时不传 `--datetime`。
-5. **用简洁清晰的列表格式回复**：不要直接展示原始表格输出，用简洁的列表格式呈现关键信息，不加粗，使用纯文本列表格式。
-6. **提醒随写入返回**：`mileage add`、`refuel add`、`maintenance add` 的 JSON 已包含 `data.reminders`，不要追加 `maintenance since` / `refuel consumption` 查询；主动转述 `overdue` 和 `due_soon` 的项目。
+| 错误码 | 含义与处理 |
+|---|---|
+| `MILEAGE_ORDER` | 新记录与前后记录的里程冲突。解释冲突的时间和里程，问用户改时间还是改里程。 |
+| `VEHICLE_AMBIGUOUS` | 匹配到多辆车。列出 `details.candidates`，问选哪辆。 |
+| `VEHICLE_NOT_FOUND` | 没有匹配车辆。用 `car list` 确认，或先 `car add`。 |
+| `MAINTENANCE_ITEM_UNKNOWN` | 项目无法识别。查看 `details.suggestions` 给候选；确认是新项目时先 `maintenance item add`。 |
+| `NO_CURRENT_MILEAGE` | 车辆还没有当前里程。问当前里程，先 `mileage add`，再重试保养写入。 |
+| `DUPLICATE_RECORD` | 疑似重复提交。告诉用户已有记录；确认确实是新记录后才加 `--force`。 |
+| `RECORD_TYPE_MISMATCH` | 该 ID 属于另一种记录类型。不要删除或更新，改用对应命令。 |
+| `DISTANCE_UNKNOWN` | 缺少里程基线。费用总额可用，每公里成本不可用；不要编造。 |
+| `DISTANCE_ZERO` | 期间没有行驶。费用总额可用，每公里成本不可用。 |
+| `PENDING_DISTANCE_INVALID` | 未加满记录与上次加满里程相同，无法计算下限。提示补里程或检查记录。 |
+| `FULLNESS_REQUIRED` | 缺少加满标记。先问"加满了吗"，不要默认加满。 |
+| `IMPORT_SCHEMA_MISMATCH` | 导出文件版本不匹配。说明文件来自其他版本，不要强行导入。 |
+| `IMPORT_CONFLICT` | 合并身份冲突。展示 `details`，确认后再考虑 `--replace --yes`；替换前必须获得用户同意。 |
+| `DOCTOR_ISSUES`（exit 6） | `doctor` 发现 error 级问题。逐条转述 `issues[].message` 和 `suggested_command`，不要自动执行修复。 |
+
+## 破坏性操作
+
+以下操作执行前必须向用户说明影响范围并获得明确确认：
+
+- `car delete <车辆>`：软删除车辆及其记录/杂费/规则；有数据时需要 `--yes`。
+- `delete-all`：批量软删除记录；必须带 `--yes`。
+- `import --replace`：替换导出范围内的车辆数据；必须同时带 `--yes`。
+- 任何 `delete` 子命令，以及用 `--force` 绕过重复/顺序校验。
+
+## 回复格式
+
+回复简洁、可扫读，优先使用列表，不加粗：
+
+- 记录成功：项目、金额/油量、里程、时间。
+- 计算结果：本次油耗、每公里油费、综合平均（如果可得）。
+- 提醒：只列 `overdue` 和 `due_soon`；`ok`/`unknown` 可以省略。
+- 费用：本期总计 + 主要分类。
+- 错误：原因 + 建议的修正方式。
+
+示例：
+
+```text
+已记录加油：40 L，300 元，单价 7.50 元/L，里程 12,345 km。
+本次油耗：9.52 L/100km，每公里油费 0.71 元。
+提醒：机油距下次更换还有 320 km（约 12 天）。
+```
+
+## 关键规则
+
+1. **每条命令都加 `--json`**，不要解析人类表格；字段和错误码是稳定契约。
+2. **一次写意图只调用一次写入命令**；不要追加 `refuel consumption` / `maintenance since` / `maintenance status`。
+3. **不要自己计算油耗或保养到期**。油耗看 `data.fuel`，提醒看 `data.reminders`，费用看 `data.totals`。
+4. **加满/未加满必须显式**：`--full` 或 `--partial`；`--fuel-level` 隐含未加满。不要默认加满。
+5. **里程是总里程**：用户说"今天跑了 300 公里"时，从上下文推断总里程，不要写增量。
+6. **项目解析**：`--items` 支持代码、中文名称、别名，可用逗号、顿号分隔或重复传；无法识别时给候选，不猜。
+7. **成本口径**：`fuel_consumption_cost_per_km` 是已闭合分段口径，`fuel_spent_per_km` 是现金支出口径，不要混用。
+8. **提醒排序**：`overdue`、`due_soon`、`ok`、`unknown`；只主动转述前两类。
