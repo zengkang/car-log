@@ -14,8 +14,76 @@ function ensureTrailingNewline(text) {
 function writeLine(ctx, text) {
   ctx.stdout(ensureTrailingNewline(text));
 }
+var MONEY_KEYS = new Set([
+  "cost",
+  "amount",
+  "fuel",
+  "maintenance",
+  "other",
+  "total",
+  "daily_average",
+  "cash_spent",
+  "fuel_consumption_cost",
+  "price_per_liter"
+]);
+var VOLUME_KEYS = new Set([
+  "liters",
+  "drop_liters",
+  "remaining_liters",
+  "liters_after_fill"
+]);
+function outputPrecision(key) {
+  if (key === undefined)
+    return null;
+  if (key === "l_per_100km")
+    return 2;
+  if (key.endsWith("_per_km") || key === "cost_per_km" || key === "total_cost_per_km") {
+    return 3;
+  }
+  if (key === "ratio")
+    return 4;
+  if (VOLUME_KEYS.has(key))
+    return 2;
+  if (MONEY_KEYS.has(key) || key.includes("cost"))
+    return 2;
+  return null;
+}
+function roundNumber(value, decimals) {
+  if (!Number.isFinite(value))
+    return value;
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
+}
+function roundOutputValue(value, key) {
+  if (key === "document")
+    return value;
+  if (typeof value === "number") {
+    const precision = outputPrecision(key);
+    return precision === null ? value : roundNumber(value, precision);
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => roundOutputValue(entry, key));
+  }
+  if (value !== null && typeof value === "object") {
+    if (value instanceof Date)
+      return value;
+    const rounded = {};
+    for (const [childKey, childValue] of Object.entries(value)) {
+      rounded[childKey] = roundOutputValue(childValue, childKey);
+    }
+    return rounded;
+  }
+  return value;
+}
+function roundOutput(data) {
+  return roundOutputValue(data, undefined);
+}
 function successEnvelope(data) {
-  return { ok: true, schema_version: JSON_SCHEMA_VERSION, data };
+  return {
+    ok: true,
+    schema_version: JSON_SCHEMA_VERSION,
+    data: roundOutput(data)
+  };
 }
 function errorEnvelope(error) {
   return {
@@ -419,23 +487,86 @@ function argvHasFlag(argv, name) {
   }
   return false;
 }
+function argvHasExactFlag(argv, name) {
+  const target = `--${name}`;
+  for (const token of argv) {
+    if (token === "--")
+      return false;
+    if (token === target)
+      return true;
+  }
+  return false;
+}
 
 // src/utils.ts
+var DATETIME_PATTERN = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?([Zz]|[+-]\d{2}:\d{2})?)?$/;
+function pad2(value) {
+  return value.toString().padStart(2, "0");
+}
+function isLeapYear(year) {
+  return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+}
+function daysInMonth(year, month) {
+  switch (month) {
+    case 2:
+      return isLeapYear(year) ? 29 : 28;
+    case 4:
+    case 6:
+    case 9:
+    case 11:
+      return 30;
+    default:
+      return 31;
+  }
+}
+function invalidDatetime(input) {
+  throw new Error(`Invalid datetime format: "${input}". Expected YYYY-MM-DD, ` + "YYYY-MM-DD HH:MM[:SS], YYYY-MM-DDTHH:MM[:SS], or an ISO datetime " + "with a Z/\xB1HH:MM offset.");
+}
+function formatParts(year, month, day, hour, minute, second) {
+  return `${year.toString().padStart(4, "0")}-${pad2(month)}-${pad2(day)} ` + `${pad2(hour)}:${pad2(minute)}:${pad2(second)}`;
+}
 function parseDatetime(input, now = () => new Date) {
   if (!input || input.trim() === "") {
     return formatNow(now);
   }
   const trimmed = input.trim();
-  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(trimmed)) {
-    return trimmed;
+  const match = DATETIME_PATTERN.exec(trimmed);
+  if (!match)
+    invalidDatetime(input);
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hasTime = match[4] !== undefined;
+  const hour = hasTime ? Number(match[4]) : 0;
+  const minute = hasTime ? Number(match[5]) : 0;
+  const second = match[6] !== undefined ? Number(match[6]) : 0;
+  const offset = match[7];
+  if (month < 1 || month > 12)
+    invalidDatetime(input);
+  if (day < 1 || day > daysInMonth(year, month))
+    invalidDatetime(input);
+  if (hour > 23 || minute > 59 || second > 59)
+    invalidDatetime(input);
+  if (offset === undefined) {
+    return formatParts(year, month, day, hour, minute, second);
   }
-  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(trimmed)) {
-    return trimmed.replace("T", " ").substring(0, 19);
+  let offsetMinutes = 0;
+  if (offset !== "Z" && offset !== "z") {
+    const offsetHour = Number(offset.slice(1, 3));
+    const offsetMinute = Number(offset.slice(4, 6));
+    if (offsetHour > 23 || offsetMinute > 59)
+      invalidDatetime(input);
+    const sign = offset.startsWith("-") ? -1 : 1;
+    offsetMinutes = sign * (offsetHour * 60 + offsetMinute);
   }
-  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
-    return trimmed + " 00:00:00";
-  }
-  throw new Error(`Invalid datetime format: "${input}". Expected YYYY-MM-DD or YYYY-MM-DD HH:MM:SS.`);
+  const instant = new Date(0);
+  instant.setUTCFullYear(year, month - 1, day);
+  instant.setUTCHours(hour, minute, second, 0);
+  const local = new Date(instant.getTime() - offsetMinutes * 60000);
+  const localYear = local.getFullYear();
+  if (localYear < 0 || localYear > 9999)
+    invalidDatetime(input);
+  return formatParts(localYear, local.getMonth() + 1, local.getDate(), local.getHours(), local.getMinutes(), local.getSeconds());
 }
 function formatNow(now = () => new Date) {
   return formatDate(now());
@@ -1053,14 +1184,30 @@ function createMigrationBackup(db, now = () => new Date) {
 function runMigrationTransaction(db, migrate) {
   db.exec("PRAGMA foreign_keys = OFF");
   try {
-    runInTransaction(db, migrate);
-    const violations = db.query("PRAGMA foreign_key_check").all();
-    if (violations.length > 0) {
-      throw new Error(`\u8FC1\u79FB\u540E\u5916\u952E\u6821\u9A8C\u5931\u8D25\uFF1A${violations.length} \u884C\u8FDD\u53CD\u5916\u952E\u7EA6\u675F`);
-    }
+    runInTransaction(db, () => {
+      migrate();
+      const violations = db.query("PRAGMA foreign_key_check").all();
+      if (violations.length > 0) {
+        throw new Error(`\u8FC1\u79FB\u540E\u5916\u952E\u6821\u9A8C\u5931\u8D25\uFF1A${violations.length} \u884C\u8FDD\u53CD\u5916\u952E\u7EA6\u675F`);
+      }
+    });
   } finally {
     db.exec("PRAGMA foreign_keys = ON");
   }
+}
+function migrationFailed(error, options) {
+  if (error instanceof DomainError && error.code === "MIGRATION_FAILED") {
+    return error;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  const hint = "\u6570\u636E\u5E93\u672A\u8FC1\u79FB\uFF0C\u539F\u5E93\u548C\u8FC1\u79FB\u524D\u5907\u4EFD\u4ECD\u53EF\u7528";
+  return new DomainError("MIGRATION_FAILED", message, {
+    hint: options.backupPath ? `${hint}\uFF1B\u5907\u4EFD\uFF1A${options.backupPath}` : hint,
+    details: {
+      backup_path: options.backupPath,
+      user_version: options.userVersion
+    }
+  });
 }
 function initDb(db) {
   const version = readUserVersion(db);
@@ -1068,20 +1215,32 @@ function initDb(db) {
     return;
   if (version === 0) {
     if (!hasLegacyCoreTables(db)) {
-      runInTransaction(db, () => {
-        createSchemaV2(db);
-        writeUserVersion(db, DB_SCHEMA_VERSION);
-      });
+      try {
+        runInTransaction(db, () => {
+          createSchemaV2(db);
+          writeUserVersion(db, DB_SCHEMA_VERSION);
+        });
+      } catch (error) {
+        throw migrationFailed(error, {
+          backupPath: null,
+          userVersion: version
+        });
+      }
       return;
     }
-    createMigrationBackup(db);
-    runMigrationTransaction(db, () => {
-      migrateLegacySchemaToV2(db);
-      writeUserVersion(db, DB_SCHEMA_VERSION);
-    });
+    let backupPath = null;
+    try {
+      backupPath = createMigrationBackup(db);
+      runMigrationTransaction(db, () => {
+        migrateLegacySchemaToV2(db);
+        writeUserVersion(db, DB_SCHEMA_VERSION);
+      });
+    } catch (error) {
+      throw migrationFailed(error, { backupPath, userVersion: version });
+    }
     return;
   }
-  throw new Error(`\u4E0D\u652F\u6301\u7684\u6570\u636E\u5E93 schema \u7248\u672C ${version}\uFF08\u5F53\u524D\u652F\u6301 legacy \u7248\u672C 0 \u548C\u76EE\u6807\u7248\u672C ${DB_SCHEMA_VERSION}\uFF09`);
+  throw migrationFailed(new Error(`\u4E0D\u652F\u6301\u7684\u6570\u636E\u5E93 schema \u7248\u672C ${version}\uFF08\u5F53\u524D\u652F\u6301 legacy \u7248\u672C 0 \u548C\u76EE\u6807\u7248\u672C ${DB_SCHEMA_VERSION}\uFF09`), { backupPath: null, userVersion: version });
 }
 
 // src/cli/db.ts
@@ -1091,8 +1250,17 @@ function getCliDb(ctx) {
     return ctx.db;
   const path = ctx.dbPath ?? getDbPath();
   if (!cached || cached.path !== path) {
+    if (cached) {
+      cached.db.close();
+      cached = undefined;
+    }
     const db = createDatabase(path);
-    initDb(db);
+    try {
+      initDb(db);
+    } catch (error) {
+      db.close();
+      throw error;
+    }
     cached = { path, db };
   }
   return cached.db;
@@ -1202,26 +1370,33 @@ function getPreviousRecord(db, vehicleId, datetime, options = {}) {
   return db.query(`SELECT * FROM records WHERE ${conditions.join(" AND ")}` + " ORDER BY datetime DESC, id DESC LIMIT 1").get(...params) ?? undefined;
 }
 function findMileageConflict(db, input) {
-  const excludeSql = input.excludeId === undefined ? "" : " AND id <> ?";
-  const excludeParam = input.excludeId === undefined ? [] : [input.excludeId];
-  const before = db.query(`SELECT * FROM records
-       WHERE vehicle_id = ? AND deleted = 0 AND mileage IS NOT NULL
-         AND datetime < ?${excludeSql}
-       ORDER BY mileage DESC, datetime DESC, id DESC LIMIT 1`).get(input.vehicleId, input.datetime, ...excludeParam);
+  const isUpdate = input.excludeId !== undefined;
+  const before = isUpdate ? db.query(`SELECT * FROM records
+           WHERE vehicle_id = ? AND deleted = 0 AND mileage IS NOT NULL
+             AND (datetime < ? OR (datetime = ? AND id < ?))
+           ORDER BY mileage DESC, datetime DESC, id DESC LIMIT 1`).get(input.vehicleId, input.datetime, input.datetime, input.excludeId) : db.query(`SELECT * FROM records
+           WHERE vehicle_id = ? AND deleted = 0 AND mileage IS NOT NULL
+             AND datetime < ?
+           ORDER BY mileage DESC, datetime DESC, id DESC LIMIT 1`).get(input.vehicleId, input.datetime);
   if (before && input.mileage < before.mileage) {
     return { direction: "before", record: before };
   }
-  const after = db.query(`SELECT * FROM records
-       WHERE vehicle_id = ? AND deleted = 0 AND mileage IS NOT NULL
-         AND datetime > ?${excludeSql}
-       ORDER BY mileage ASC, datetime ASC, id ASC LIMIT 1`).get(input.vehicleId, input.datetime, ...excludeParam);
+  const after = isUpdate ? db.query(`SELECT * FROM records
+           WHERE vehicle_id = ? AND deleted = 0 AND mileage IS NOT NULL
+             AND (datetime > ? OR (datetime = ? AND id > ?))
+           ORDER BY mileage ASC, datetime ASC, id ASC LIMIT 1`).get(input.vehicleId, input.datetime, input.datetime, input.excludeId) : db.query(`SELECT * FROM records
+           WHERE vehicle_id = ? AND deleted = 0 AND mileage IS NOT NULL
+             AND datetime > ?
+           ORDER BY mileage ASC, datetime ASC, id ASC LIMIT 1`).get(input.vehicleId, input.datetime);
   if (after && input.mileage > after.mileage) {
     return { direction: "after", record: after };
   }
+  if (isUpdate)
+    return null;
   const sameTime = db.query(`SELECT * FROM records
        WHERE vehicle_id = ? AND deleted = 0 AND mileage IS NOT NULL
-         AND datetime = ?${excludeSql}
-       ORDER BY mileage DESC, id DESC LIMIT 1`).get(input.vehicleId, input.datetime, ...excludeParam);
+         AND datetime = ?
+       ORDER BY mileage DESC, id DESC LIMIT 1`).get(input.vehicleId, input.datetime);
   if (sameTime && input.mileage < sameTime.mileage) {
     return { direction: "same_time", record: sameTime };
   }
@@ -1835,9 +2010,9 @@ function getMaintenanceRecordItems(db, recordId) {
 }
 
 // src/reminders.ts
-var DATETIME_PATTERN = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/;
+var DATETIME_PATTERN2 = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/;
 function parseDatetimeParts(value) {
-  const match = DATETIME_PATTERN.exec(value.trim());
+  const match = DATETIME_PATTERN2.exec(value.trim());
   if (!match)
     return null;
   const parts = {
@@ -1853,13 +2028,13 @@ function parseDatetimeParts(value) {
   }
   return parts;
 }
-function pad2(value) {
+function pad22(value) {
   return value.toString().padStart(2, "0");
 }
-function formatParts(parts) {
-  return `${parts.year.toString().padStart(4, "0")}-${pad2(parts.month)}-${pad2(parts.day)} ` + `${pad2(parts.hour)}:${pad2(parts.minute)}:${pad2(parts.second)}`;
+function formatParts2(parts) {
+  return `${parts.year.toString().padStart(4, "0")}-${pad22(parts.month)}-${pad22(parts.day)} ` + `${pad22(parts.hour)}:${pad22(parts.minute)}:${pad22(parts.second)}`;
 }
-function daysInMonth(year, month) {
+function daysInMonth2(year, month) {
   return new Date(Date.UTC(year, month, 0)).getUTCDate();
 }
 function addMonths(datetime, months) {
@@ -1872,8 +2047,8 @@ function addMonths(datetime, months) {
   const totalMonths = parts.year * 12 + (parts.month - 1) + months;
   const targetYear = Math.floor(totalMonths / 12);
   const targetMonth = (totalMonths % 12 + 12) % 12 + 1;
-  const targetDay = Math.min(parts.day, daysInMonth(targetYear, targetMonth));
-  return formatParts({
+  const targetDay = Math.min(parts.day, daysInMonth2(targetYear, targetMonth));
+  return formatParts2({
     year: targetYear,
     month: targetMonth,
     day: targetDay,
@@ -2253,7 +2428,7 @@ function findDuplicateRecord(db, input) {
   }
   return db.query(`SELECT * FROM records WHERE ${conditions.join(" AND ")}` + " ORDER BY id DESC LIMIT 1").get(...params) ?? undefined;
 }
-function findIdempotencyRecord(db, key) {
+function findIdempotencyRecord(db, key, expected) {
   const settingKey = `${IDEMPOTENCY_KEY_PREFIX}${key}`;
   const row = db.query("SELECT value FROM settings WHERE key = ?").get(settingKey);
   if (!row)
@@ -2267,6 +2442,18 @@ function findIdempotencyRecord(db, key) {
   if (!record) {
     db.query("DELETE FROM settings WHERE key = ?").run(settingKey);
     return;
+  }
+  if (record.record_type !== expected.recordType || record.vehicle_id !== expected.vehicleId) {
+    throw new DomainError("DUPLICATE_RECORD", `idempotency-key\u300C${key}\u300D\u5DF2\u7528\u4E8E\u5176\u4ED6\u8BB0\u5F55 (ID: ${record.id}, ${record.record_type}, \u8F66\u8F86 ${record.vehicle_id})\uFF0C\u8BF7\u6362\u4E00\u4E2A key`, {
+      details: {
+        idempotency_key: key,
+        existing_record_id: record.id,
+        existing_record_type: record.record_type,
+        existing_vehicle_id: record.vehicle_id,
+        expected_record_type: expected.recordType,
+        expected_vehicle_id: expected.vehicleId
+      }
+    });
   }
   return record;
 }
@@ -2618,7 +2805,10 @@ function createRefuelRecord(db, input, options = {}) {
   const datetime = parseDatetime(input.datetime, now);
   const note = input.note ?? null;
   if (options.idempotencyKey !== undefined) {
-    const replay = findIdempotencyRecord(db, options.idempotencyKey);
+    const replay = findIdempotencyRecord(db, options.idempotencyKey, {
+      recordType: "refuel",
+      vehicleId: input.vehicle_id
+    });
     if (replay) {
       return {
         record: replay,
@@ -2703,27 +2893,15 @@ function updateRefuelRecord(db, id, patch, options = {}) {
   const now = options.now ?? defaultNow;
   const existing = assertRecordType(db, id, "refuel");
   const vehicle = assertActiveVehicle(db, existing.vehicle_id);
-  const mileage = patch.mileage ?? existing.mileage;
-  const liters = patch.liters ?? existing.liters;
-  const cost = patch.cost ?? existing.cost;
-  if (mileage === null || mileage === undefined) {
-    throw new DomainError("INVALID_ARGUMENT", "\u8BE5\u52A0\u6CB9\u8BB0\u5F55\u7F3A\u5C11\u91CC\u7A0B\u503C\uFF0C\u65E0\u6CD5\u66F4\u65B0", {
-      details: { record_id: id }
-    });
-  }
-  if (liters === null || liters === undefined) {
-    throw new DomainError("INVALID_ARGUMENT", "\u8BE5\u52A0\u6CB9\u8BB0\u5F55\u7F3A\u5C11\u6CB9\u91CF\uFF0C\u65E0\u6CD5\u66F4\u65B0", {
-      details: { record_id: id }
-    });
-  }
-  if (cost === null || cost === undefined) {
-    throw new DomainError("INVALID_ARGUMENT", "\u8BE5\u52A0\u6CB9\u8BB0\u5F55\u7F3A\u5C11\u91D1\u989D\uFF0C\u65E0\u6CD5\u66F4\u65B0", {
-      details: { record_id: id }
-    });
-  }
-  requirePositive("mileage", mileage);
-  requirePositive("liters", liters);
-  requirePositive("cost", cost);
+  const mileage = patch.mileage !== undefined ? patch.mileage : existing.mileage;
+  const liters = patch.liters !== undefined ? patch.liters : existing.liters;
+  const cost = patch.cost !== undefined ? patch.cost : existing.cost;
+  if (patch.mileage !== undefined)
+    requirePositive("mileage", patch.mileage);
+  if (patch.liters !== undefined)
+    requirePositive("liters", patch.liters);
+  if (patch.cost !== undefined)
+    requirePositive("cost", patch.cost);
   const isFull = patch.is_full ?? existing.is_full === 1;
   let fuelLevel;
   if (isFull) {
@@ -2739,27 +2917,29 @@ function updateRefuelRecord(db, id, patch, options = {}) {
   validateFuelLevel(fuelLevel, vehicle.tank_capacity_l);
   const datetime = patch.datetime !== undefined ? parseDatetime(patch.datetime, now) : existing.datetime;
   const warnings = [];
-  const conflict = findMileageConflict(db, {
-    vehicleId: existing.vehicle_id,
-    mileage,
-    datetime,
-    excludeId: id
-  });
-  if (conflict) {
-    if (options.force !== true) {
-      throw mileageOrderError(conflict, {
-        vehicleId: existing.vehicle_id,
-        mileage,
-        datetime,
-        excludeId: id
-      });
-    }
-    warnings.push(mileageOrderWarning(conflict, {
+  if (mileage !== null) {
+    const conflict = findMileageConflict(db, {
       vehicleId: existing.vehicle_id,
       mileage,
       datetime,
       excludeId: id
-    }));
+    });
+    if (conflict) {
+      if (options.force !== true) {
+        throw mileageOrderError(conflict, {
+          vehicleId: existing.vehicle_id,
+          mileage,
+          datetime,
+          excludeId: id
+        });
+      }
+      warnings.push(mileageOrderWarning(conflict, {
+        vehicleId: existing.vehicle_id,
+        mileage,
+        datetime,
+        excludeId: id
+      }));
+    }
   }
   if (options.dryRun === true) {
     return {
@@ -2780,13 +2960,16 @@ function updateRefuelRecord(db, id, patch, options = {}) {
     };
   }
   const recordPatch = {
-    mileage,
-    liters,
-    cost,
     datetime,
     is_full: isFull,
     fuel_level_after: fuelLevel
   };
+  if (patch.mileage !== undefined)
+    recordPatch.mileage = patch.mileage;
+  if (patch.liters !== undefined)
+    recordPatch.liters = patch.liters;
+  if (patch.cost !== undefined)
+    recordPatch.cost = patch.cost;
   if (patch.note !== undefined)
     recordPatch.note = patch.note;
   const record = updateRecord(db, id, recordPatch, now);
@@ -2811,10 +2994,10 @@ function computeVehicleFuelSummary(db, vehicleId, options = {}) {
 function warning2(code, message, details) {
   return details === undefined ? { code, message } : { code, message, details };
 }
-function pad22(value) {
+function pad23(value) {
   return value.toString().padStart(2, "0");
 }
-function daysInMonth2(year, month) {
+function daysInMonth3(year, month) {
   return new Date(Date.UTC(year, month, 0)).getUTCDate();
 }
 function dateOf2(datetime) {
@@ -2868,10 +3051,10 @@ function resolvePeriod(options = {}) {
     const year = options.year;
     if (options.month !== undefined) {
       const month = options.month;
-      const lastDay = daysInMonth2(year, month);
+      const lastDay = daysInMonth3(year, month);
       return {
-        from: `${year}-${pad22(month)}-01 00:00:00`,
-        to: `${year}-${pad22(month)}-${pad22(lastDay)} 23:59:59`,
+        from: `${year}-${pad23(month)}-01 00:00:00`,
+        to: `${year}-${pad23(month)}-${pad23(lastDay)} 23:59:59`,
         year,
         month
       };
@@ -3191,7 +3374,7 @@ function computeMileageStats(db, vehicleId, options = {}) {
   }
   const byMonth = [...byMonthMap.entries()].filter(([, monthDistance]) => monthDistance !== 0).sort(([a], [b]) => a.localeCompare(b)).map(([month, monthDistance]) => {
     const [yearPart, monthPart] = month.split("-");
-    const days2 = daysInMonth2(Number(yearPart), Number(monthPart));
+    const days2 = daysInMonth3(Number(yearPart), Number(monthPart));
     return {
       month,
       distance: monthDistance,
@@ -3351,6 +3534,9 @@ function periodLabel(period) {
 }
 
 // src/cli/commands/summary.ts
+function formatPerKm(value) {
+  return value === null ? "-" : value.toFixed(3);
+}
 function renderReminder(ctx, reminder) {
   const details = [];
   if (reminder.remaining_km !== null) {
@@ -3409,7 +3595,7 @@ function renderSummaryHuman(ctx, summary) {
   } else if (totals.distance === 0) {
     writeLine(ctx, "  \u8DDD\u79BB 0 km\uFF0C\u6BCF\u516C\u91CC\u6210\u672C\u4E0D\u53EF\u7528");
   } else {
-    writeLine(ctx, `  \u8DDD\u79BB ${totals.distance.toLocaleString("zh-CN")} km\uFF1B` + `\u7EFC\u5408\u6210\u672C/\u516C\u91CC ${totals.total_cost_per_km?.toFixed(3)} \u5143\uFF1B` + `\u71C3\u6CB9\u73B0\u91D1/\u516C\u91CC ${totals.fuel_spent_per_km?.toFixed(3)} \u5143\uFF1B` + `\u71C3\u6CB9\u6D88\u8017\u6210\u672C/\u516C\u91CC ${totals.fuel_consumption_cost_per_km?.toFixed(3)} \u5143`);
+    writeLine(ctx, `  \u8DDD\u79BB ${totals.distance.toLocaleString("zh-CN")} km\uFF1B` + `\u7EFC\u5408\u6210\u672C/\u516C\u91CC ${formatPerKm(totals.total_cost_per_km)} \u5143\uFF1B` + `\u71C3\u6CB9\u73B0\u91D1/\u516C\u91CC ${formatPerKm(totals.fuel_spent_per_km)} \u5143\uFF1B` + `\u71C3\u6CB9\u6D88\u8017\u6210\u672C/\u516C\u91CC ${formatPerKm(totals.fuel_consumption_cost_per_km)} \u5143`);
     if (totals.daily_average !== null) {
       writeLine(ctx, `  \u65E5\u5747 ${formatCurrency(totals.daily_average)}` + (totals.days !== null ? `\uFF08${totals.days} \u5929\uFF09` : ""));
     }
@@ -3726,7 +3912,10 @@ function createMileageRecord(db, input, options = {}) {
   const datetime = parseDatetime(input.datetime, now);
   const note = input.note ?? null;
   if (options.idempotencyKey !== undefined) {
-    const replay = findIdempotencyRecord(db, options.idempotencyKey);
+    const replay = findIdempotencyRecord(db, options.idempotencyKey, {
+      recordType: "mileage",
+      vehicleId: input.vehicle_id
+    });
     if (replay) {
       return {
         record: replay,
@@ -3976,7 +4165,12 @@ var update2 = {
     { name: "dry-run", boolean: true, description: "\u53EA\u9884\u89C8\uFF0C\u4E0D\u5199\u5E93" }
   ],
   examples: ["carlog mileage update 7 --mileage 12600"],
-  outputFields: ["data.record", "data.current_mileage", "data.warnings"],
+  outputFields: [
+    "data.record",
+    "data.current_mileage",
+    "data.reminders",
+    "data.warnings"
+  ],
   errorCodes: [
     "INVALID_ARGUMENT",
     "RECORD_NOT_FOUND",
@@ -4014,6 +4208,7 @@ var update2 = {
       vehicle: vehicleToView(db, vehicle),
       record: recordToView(result.record, { preview: result.dryRun }),
       current_mileage: getCurrentMileage(db, vehicle.id),
+      reminders: getVehicleReminders(db, vehicle.id, { now: ctx.now }),
       warnings: result.warnings,
       dry_run: result.dryRun
     };
@@ -4294,7 +4489,7 @@ var add3 = {
       order: "asc"
     });
     let fuel;
-    if (result.dryRun) {
+    if (result.dryRun && !result.replayed) {
       const maxId = records.reduce((max, item) => Math.max(max, item.id), 0);
       fuel = computeFuelSummary([...records, { ...record, id: maxId + 1 }], {
         currentMileage: previewCurrentMileage(db, vehicle.id, record),
@@ -4364,6 +4559,7 @@ var update3 = {
     "data.record",
     "data.price_per_liter",
     "data.fuel",
+    "data.reminders",
     "data.warnings"
   ],
   errorCodes: [
@@ -4466,7 +4662,7 @@ var update3 = {
       record: recordToView(record, { preview: result.dryRun }),
       price_per_liter: record.cost !== null && record.liters !== null ? record.cost / record.liters : null,
       fuel: fuelOverview(fuel),
-      reminders: null,
+      reminders: getVehicleReminders(db, vehicle.id, { now: ctx.now }),
       warnings: result.warnings,
       dry_run: result.dryRun
     };
@@ -4732,7 +4928,10 @@ function createMaintenanceRecord(db, input, options = {}) {
   const note = input.note ?? null;
   const cost = input.cost ?? null;
   if (options.idempotencyKey !== undefined) {
-    const replay = findIdempotencyRecord(db, options.idempotencyKey);
+    const replay = findIdempotencyRecord(db, options.idempotencyKey, {
+      recordType: "maintenance",
+      vehicleId: input.vehicle_id
+    });
     if (replay) {
       return {
         record: replay,
@@ -6659,11 +6858,11 @@ function buildExportDocument(db, options) {
   const records = vehicleIds.length === 0 ? [] : db.query(`SELECT * FROM records
              WHERE vehicle_id IN (${placeholders(vehicleIds.length)})${deletedFilter}
              ORDER BY id ASC`).all(...vehicleIds);
-  const recordIds = records.map((record) => record.id);
-  const maintenance_record_items = recordIds.length === 0 ? [] : db.query(`SELECT record_id, item_id, cost, note
-             FROM maintenance_record_items
-             WHERE record_id IN (${placeholders(recordIds.length)})
-             ORDER BY record_id ASC, item_id ASC`).all(...recordIds);
+  const maintenance_record_items = vehicleIds.length === 0 ? [] : db.query(`SELECT mri.record_id, mri.item_id, mri.cost, mri.note
+             FROM maintenance_record_items mri
+             JOIN records r ON r.id = mri.record_id
+             WHERE r.vehicle_id IN (${placeholders(vehicleIds.length)})${includeDeleted ? "" : " AND r.deleted = 0"}
+             ORDER BY mri.record_id ASC, mri.item_id ASC`).all(...vehicleIds);
   const vehicle_maintenance_rules = vehicleIds.length === 0 ? [] : db.query(`SELECT * FROM vehicle_maintenance_rules
              WHERE vehicle_id IN (${placeholders(vehicleIds.length)})
              ORDER BY id ASC`).all(...vehicleIds);
@@ -6733,7 +6932,8 @@ var exportCommand = {
     "data.file",
     "data.counts",
     "data.schema_version",
-    "data.db_schema_version"
+    "data.db_schema_version",
+    "data.document"
   ],
   errorCodes: ["INVALID_ARGUMENT", "VEHICLE_NOT_FOUND", "VEHICLE_AMBIGUOUS"],
   handler: (ctx, inv) => {
@@ -6748,6 +6948,16 @@ var exportCommand = {
     });
     const counts = countExportDocument(document);
     if (output === undefined) {
+      if (inv.globals.json) {
+        emitSuccess(ctx, true, {
+          file: null,
+          counts,
+          schema_version: EXPORT_SCHEMA_VERSION,
+          db_schema_version: DB_SCHEMA_VERSION,
+          document
+        });
+        return;
+      }
       ctx.stdout(`${JSON.stringify(document, null, 2)}
 `);
       return;
@@ -6827,6 +7037,31 @@ function optionalString(row, field, context) {
   }
   return value;
 }
+function normalizeImportedDatetime(value, field, context) {
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    invalid5(`${context} \u7684 ${field} \u4E0D\u80FD\u4E3A\u7A7A`, { field, context, value });
+  }
+  try {
+    return parseDatetime(trimmed);
+  } catch {
+    invalid5(`${context} \u7684 ${field} \u4E0D\u662F\u6709\u6548\u65E5\u671F\u65F6\u95F4\uFF1A\u300C${value}\u300D\uFF0C` + "\u8BF7\u4F7F\u7528 YYYY-MM-DD\u3001YYYY-MM-DD HH:MM[:SS] \u6216\u5E26 Z/\xB1HH:MM \u504F\u79FB\u7684 ISO \u65F6\u95F4", {
+      field,
+      context,
+      value,
+      expected: "YYYY-MM-DD HH:MM:SS"
+    });
+  }
+}
+function requiredDatetime(row, field, context) {
+  return normalizeImportedDatetime(requireString(row, field, context), field, context);
+}
+function optionalDatetime(row, field, context) {
+  const value = optionalString(row, field, context);
+  if (value === null)
+    return null;
+  return normalizeImportedDatetime(value, field, context);
+}
 function requireNumber(row, field, context) {
   const value = row[field];
   if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -6860,7 +7095,7 @@ function timestamp(row, field, context, fallback) {
   if (typeof value !== "string" || value.trim() === "") {
     invalid5(`${context} \u7684 ${field} \u5FC5\u987B\u662F\u65F6\u95F4\u5B57\u7B26\u4E32`, { field });
   }
-  return value;
+  return normalizeImportedDatetime(value, field, context);
 }
 function oneOf(row, field, context, allowed) {
   const value = requireString(row, field, context);
@@ -6908,7 +7143,7 @@ function parseDocument(raw, stamp) {
       plate: optionalString(row, "plate", context),
       tank_capacity_l: tank,
       initial_mileage: initialMileage,
-      initial_datetime: optionalString(row, "initial_datetime", context),
+      initial_datetime: optionalDatetime(row, "initial_datetime", context),
       created_at: timestamp(row, "created_at", context, stamp),
       updated_at: timestamp(row, "updated_at", context, stamp),
       deleted: flag(row, "deleted", context, 0)
@@ -6971,7 +7206,7 @@ function parseDocument(raw, stamp) {
       id: requireId(row, "id", context),
       vehicle_id: requireId(row, "vehicle_id", context),
       record_type: recordType,
-      datetime: requireString(row, "datetime", context),
+      datetime: requiredDatetime(row, "datetime", context),
       mileage: optionalNumber(row, "mileage", context),
       liters: optionalNumber(row, "liters", context),
       cost: optionalNumber(row, "cost", context),
@@ -7017,7 +7252,7 @@ function parseDocument(raw, stamp) {
       interval_km: intervalKm,
       interval_months: intervalMonths,
       baseline_mileage: baselineMileage,
-      baseline_datetime: optionalString(row, "baseline_datetime", context),
+      baseline_datetime: optionalDatetime(row, "baseline_datetime", context),
       enabled: flag(row, "enabled", context, 1),
       created_at: timestamp(row, "created_at", context, stamp),
       updated_at: timestamp(row, "updated_at", context, stamp)
@@ -7034,7 +7269,7 @@ function parseDocument(raw, stamp) {
       vehicle_id: requireId(row, "vehicle_id", context),
       category: oneOf(row, "category", context, EXPENSE_CATEGORY_CODES),
       amount,
-      datetime: requireString(row, "datetime", context),
+      datetime: requiredDatetime(row, "datetime", context),
       note: optionalString(row, "note", context),
       created_at: timestamp(row, "created_at", context, stamp),
       updated_at: timestamp(row, "updated_at", context, stamp),
@@ -7163,18 +7398,48 @@ function importDocument(db, raw, options = {}) {
     replaced: 0
   };
   const apply = () => {
+    const recordIdCeiling = db.query("SELECT MAX(id) AS max_id FROM records").get()?.max_id ?? 0;
+    const expenseIdCeiling = db.query("SELECT MAX(id) AS max_id FROM expenses").get()?.max_id ?? 0;
     const vehicleMap = new Map;
     const targetVehicles = db.query("SELECT * FROM vehicles ORDER BY id ASC").all();
     const claimedVehicleIds = new Set;
     for (const row of document.vehicles) {
-      const candidates = targetVehicles.filter((candidate2) => candidate2.deleted === row.deleted && (candidate2.name === row.name || row.plate !== null && candidate2.plate === row.plate));
+      const sameDeleted = targetVehicles.filter((candidate2) => candidate2.deleted === row.deleted);
+      const nameMatches = sameDeleted.filter((candidate2) => candidate2.name === row.name);
+      const plateMatches = row.plate === null ? [] : sameDeleted.filter((candidate2) => candidate2.plate === row.plate);
+      const foreignPlateMatches = plateMatches.filter((candidate2) => candidate2.name !== row.name);
+      if (foreignPlateMatches.length > 0) {
+        const target = foreignPlateMatches[0];
+        conflict(`\u5BFC\u51FA\u8F66\u8F86\u300C${row.name}\u300D\uFF08\u8F66\u724C ${row.plate}\uFF09\u7684\u8F66\u724C\u5DF2\u5C5E\u4E8E\u76EE\u6807\u5E93\u4E2D\u7684` + `\u5176\u4ED6\u8F66\u8F86\u300C${target.name}\u300D\uFF08ID: ${target.id}\uFF09\uFF0C\u4E0D\u80FD\u5408\u5E76\u4E0D\u540C\u8F66\u8F86`, {
+          entity: "vehicle",
+          reason: "plate_collision",
+          matched_by: "plate",
+          export_vehicle_id: row.id,
+          name: row.name,
+          plate: row.plate,
+          target_vehicle_id: target.id,
+          target_vehicle_ids: foreignPlateMatches.map((candidate2) => candidate2.id),
+          target: {
+            id: target.id,
+            name: target.name,
+            plate: target.plate
+          },
+          incoming: { name: row.name, plate: row.plate }
+        });
+      }
+      const candidates = nameMatches;
       if (candidates.length > 1) {
         conflict(`\u8F66\u8F86\u300C${row.name}\u300D\u5728\u76EE\u6807\u5E93\u4E2D\u5339\u914D\u5230\u591A\u8F86\uFF08ID: ${candidates.map((candidate2) => candidate2.id).join(", ")}\uFF09\uFF0C\u65E0\u6CD5\u786E\u5B9A\u5408\u5E76\u5BF9\u8C61`, {
           entity: "vehicle",
           export_vehicle_id: row.id,
           name: row.name,
           plate: row.plate,
-          candidate_ids: candidates.map((candidate2) => candidate2.id)
+          candidate_ids: candidates.map((candidate2) => candidate2.id),
+          target: {
+            names: candidates.map((candidate2) => candidate2.name),
+            plates: candidates.map((candidate2) => candidate2.plate)
+          },
+          incoming: { name: row.name, plate: row.plate }
         });
       }
       const candidate = candidates[0];
@@ -7183,7 +7448,9 @@ function importDocument(db, raw, options = {}) {
           conflict(`\u5BFC\u51FA\u6587\u4EF6\u4E2D\u7684\u591A\u8F86\u8F66\u6620\u5C04\u5230\u76EE\u6807\u8F66\u8F86 ID ${candidate.id}`, {
             entity: "vehicle",
             export_vehicle_id: row.id,
-            target_vehicle_id: candidate.id
+            target_vehicle_id: candidate.id,
+            target: { name: candidate.name, plate: candidate.plate },
+            incoming: { name: row.name, plate: row.plate }
           });
         }
         if (!replace && !sameVehicle(candidate, row)) {
@@ -7194,12 +7461,16 @@ function importDocument(db, raw, options = {}) {
             name: row.name,
             plate: row.plate,
             target: {
+              name: candidate.name,
+              plate: candidate.plate,
               tank_capacity_l: candidate.tank_capacity_l,
               initial_mileage: candidate.initial_mileage,
               initial_datetime: candidate.initial_datetime,
               deleted: candidate.deleted
             },
             incoming: {
+              name: row.name,
+              plate: row.plate,
               tank_capacity_l: row.tank_capacity_l,
               initial_mileage: row.initial_mileage,
               initial_datetime: row.initial_datetime,
@@ -7278,6 +7549,23 @@ function importDocument(db, raw, options = {}) {
         return itemId;
       }));
     };
+    const mappedItemCodeById = new Map;
+    for (const item of document.items) {
+      const mappedId = itemMap.get(item.id);
+      if (mappedId !== undefined)
+        mappedItemCodeById.set(mappedId, item.code);
+    }
+    const targetItemSet = (recordId) => {
+      const rows = db.query(`SELECT mri.item_id AS id, mi.code AS code
+           FROM maintenance_record_items mri
+           JOIN maintenance_items mi ON mi.id = mri.item_id
+           WHERE mri.record_id = ?
+           ORDER BY mri.item_id ASC`).all(recordId);
+      return {
+        ids: sortedUnique(rows.map((entry) => entry.id)),
+        codes: rows.map((entry) => entry.code).sort()
+      };
+    };
     for (const row of document.records) {
       const vehicleId = vehicleMap.get(row.vehicle_id);
       if (vehicleId === undefined) {
@@ -7289,20 +7577,45 @@ function importDocument(db, raw, options = {}) {
         const candidates = db.query(`SELECT * FROM records
              WHERE vehicle_id = ? AND record_type = ? AND datetime = ?
                AND mileage IS ? AND liters IS ? AND cost IS ?
-             ORDER BY id ASC`).all(vehicleId, row.record_type, row.datetime, row.mileage, row.liters, row.cost);
+               AND id <= ?
+             ORDER BY id ASC`).all(vehicleId, row.record_type, row.datetime, row.mileage, row.liters, row.cost, recordIdCeiling);
         const exportItemIds = row.record_type === "maintenance" ? mappedLinkItemIds(row.id) : [];
+        const incomingItemCodes = row.record_type === "maintenance" ? exportItemIds.map((id) => mappedItemCodeById.get(id) ?? "").sort() : [];
+        const itemSetCache = new Map;
+        const itemSetOf = (candidateId) => {
+          const cached2 = itemSetCache.get(candidateId);
+          if (cached2)
+            return cached2;
+          const set2 = row.record_type === "maintenance" ? targetItemSet(candidateId) : { ids: [], codes: [] };
+          itemSetCache.set(candidateId, set2);
+          return set2;
+        };
         const identical = candidates.find((candidate) => {
           if (candidate.is_full !== row.is_full || candidate.fuel_level_after !== row.fuel_level_after || candidate.note !== row.note || candidate.deleted !== row.deleted) {
             return false;
           }
           if (row.record_type !== "maintenance")
             return true;
-          const targetItemIds = sortedUnique(db.query("SELECT item_id FROM maintenance_record_items WHERE record_id = ?").all(candidate.id).map((link) => link.item_id));
-          return sortedEquals(targetItemIds, exportItemIds);
+          return sortedEquals(itemSetOf(candidate.id).ids, exportItemIds);
         });
         if (candidates.length > 0) {
           if (!identical) {
-            conflict(`\u8BB0\u5F55 ${row.id}\uFF08${row.record_type} @ ${row.datetime}\uFF09\u4E0E\u76EE\u6807\u5E93\u4E2D\u7684\u8BB0\u5F55 ` + `${candidates[0].id} \u81EA\u7136\u952E\u76F8\u540C\u4F46\u5B57\u6BB5\u6216\u9879\u76EE\u5173\u8054\u4E0D\u540C`, {
+            const target = candidates[0];
+            const targetItems = itemSetOf(target.id);
+            const differences = [];
+            if (target.note !== row.note)
+              differences.push("note");
+            if (target.is_full !== row.is_full)
+              differences.push("is_full");
+            if (target.fuel_level_after !== row.fuel_level_after) {
+              differences.push("fuel_level_after");
+            }
+            if (target.deleted !== row.deleted)
+              differences.push("deleted");
+            if (!sortedEquals(targetItems.ids, exportItemIds)) {
+              differences.push("maintenance_items");
+            }
+            conflict(`\u8BB0\u5F55 ${row.id}\uFF08${row.record_type} @ ${row.datetime}\uFF09\u4E0E\u76EE\u6807\u5E93\u4E2D\u7684\u8BB0\u5F55 ` + `${target.id} \u81EA\u7136\u952E\u76F8\u540C\u4F46\u5B57\u6BB5\u6216\u9879\u76EE\u5173\u8054\u4E0D\u540C\uFF1A` + `${differences.length > 0 ? differences.join(", ") : "unknown"}`, {
               entity: "record",
               export_record_id: row.id,
               target_record_ids: candidates.map((candidate) => candidate.id),
@@ -7311,7 +7624,26 @@ function importDocument(db, raw, options = {}) {
               datetime: row.datetime,
               mileage: row.mileage,
               liters: row.liters,
-              cost: row.cost
+              cost: row.cost,
+              differences,
+              differing_fields: differences,
+              target: {
+                id: target.id,
+                note: target.note,
+                is_full: target.is_full,
+                fuel_level_after: target.fuel_level_after,
+                deleted: target.deleted,
+                item_ids: targetItems.ids,
+                item_codes: targetItems.codes
+              },
+              incoming: {
+                note: row.note,
+                is_full: row.is_full,
+                fuel_level_after: row.fuel_level_after,
+                deleted: row.deleted,
+                item_ids: exportItemIds,
+                item_codes: incomingItemCodes
+              }
             });
           }
           recordMap.set(row.id, identical.id);
@@ -7398,8 +7730,8 @@ function importDocument(db, raw, options = {}) {
       if (!replace) {
         const existing = db.query(`SELECT * FROM expenses
              WHERE vehicle_id = ? AND category = ? AND amount = ?
-               AND datetime = ?
-             ORDER BY id ASC LIMIT 1`).get(vehicleId, row.category, row.amount, row.datetime);
+               AND datetime = ? AND id <= ?
+             ORDER BY id ASC LIMIT 1`).get(vehicleId, row.category, row.amount, row.datetime, expenseIdCeiling);
         if (existing) {
           if (existing.deleted !== row.deleted) {
             counts.skipped += 1;
@@ -7691,7 +8023,12 @@ function runDoctor(db, options = {}) {
     let reminders;
     try {
       reminders = getVehicleReminders(db, vehicle.id, { now, today });
-    } catch {
+    } catch (error) {
+      push("REMINDER_COMPUTE_FAILED", "error", `\u8F66\u8F86 ${vehicle.id}\uFF08${vehicle.name}\uFF09\u7684\u63D0\u9192\u8BA1\u7B97\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`, {
+        type: "vehicle",
+        vehicle_id: vehicle.id,
+        vehicle_name: vehicle.name
+      }, `maintenance rule list --car ${vehicle.id}`);
       continue;
     }
     for (const reminder of reminders) {
@@ -7788,7 +8125,7 @@ var doctor = {
     "data.counts.total",
     "data.ok"
   ],
-  errorCodes: ["DOCTOR_ISSUES", "VEHICLE_NOT_FOUND", "VEHICLE_AMBIGUOUS"],
+  errorCodes: ["VEHICLE_NOT_FOUND", "VEHICLE_AMBIGUOUS"],
   handler: (ctx, inv) => {
     const db = getCliDb(ctx);
     const car = getStringFlag(inv, "car");
@@ -8003,18 +8340,19 @@ function runCli(argv, input = {}) {
   try {
     if (argv.length === 0) {
       renderUsage(ctx);
-    } else if (argvHasFlag(argv, "version")) {
+    } else if (argvHasExactFlag(argv, "version")) {
       renderVersion(ctx, argvHasFlag(argv, "json"));
     } else {
       const parsed = parseArgv(argv, COMMANDS, FLAG_ARITY);
       if (!parsed) {
-        renderUsage(ctx);
-      } else {
-        if (parsed.globals.db !== undefined)
-          ctx.dbPath = parsed.globals.db;
-        parsed.command.handler(ctx, parsed);
-        exitCode = ctx.exitCode ?? 0;
+        throw new AppError("INVALID_ARGUMENT", "\u7F3A\u5C11\u547D\u4EE4", {
+          hint: "\u8FD0\u884C carlog help \u67E5\u770B\u53EF\u7528\u547D\u4EE4"
+        });
       }
+      if (parsed.globals.db !== undefined)
+        ctx.dbPath = parsed.globals.db;
+      parsed.command.handler(ctx, parsed);
+      exitCode = ctx.exitCode ?? 0;
     }
   } catch (error) {
     const appError = toAppError(error);
