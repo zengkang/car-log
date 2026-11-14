@@ -1,6 +1,6 @@
 ---
 name: car-log
-description: 汽车里程管理助手。当用户提到"记录里程"、"记录加油"、"记录保养"、"里程"、"加油"、"保养"、"油耗"、"车辆花费"、"保养提醒"等汽车相关记录时使用此技能。
+description: 汽车全生命周期记录助手。当用户提到"记录里程"、"记录加油"、"记录保养"、"保养项目/规则"、"保养提醒"、"油耗"、"车辆花费/用车成本"、"车辆数据导出/导入"、"车辆数据体检/doctor"等汽车相关操作时使用此技能。
 ---
 
 # 汽车里程管理
@@ -210,9 +210,10 @@ bun scripts/carlog.js maintenance update <ID> --items 机油,机滤 --json
 | `FULLNESS_REQUIRED` | 缺少加满标记。先问"加满了吗"，不要默认加满。 |
 | `IMPORT_SCHEMA_MISMATCH` | 导出文件版本不匹配。说明文件来自其他版本，不要强行导入。 |
 | `IMPORT_CONFLICT` | 合并身份冲突。展示 `details`，确认后再考虑 `--replace --yes`；替换前必须获得用户同意。 |
-| `DOCTOR_ISSUES`（exit 6） | `doctor` 发现 error 级问题。逐条转述 `issues[].message` 和 `suggested_command`，不要自动执行修复。 |
 | `MIGRATION_FAILED`（exit 6） | 数据库迁移失败，原库未迁移。`details.backup_path` 和 `hint` 给出迁移前备份路径（没有备份时为 null）；不要继续写入，告知用户备份位置并按 README 的回滚手册处理。 |
 | `INVALID_ARGUMENT` | 参数错误或缺少命令。`carlog --json` 不带命令也会返回此 code；先检查命令和参数。 |
+
+> `doctor` 的 error 级问题不走 error 信封：退出码为 6，且 `data.ok = false`；逐条转述 `data.issues[].message` 和 `suggested_command`，不要自动执行修复。
 
 warnings（`data.warnings[].code`）：
 
