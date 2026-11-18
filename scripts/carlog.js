@@ -265,7 +265,8 @@ function toAppError(error) {
 var GLOBAL_FLAGS = new Map([
   ["db", false],
   ["json", true],
-  ["version", true]
+  ["version", true],
+  ["help", true]
 ]);
 function isGlobalFlag(name) {
   return GLOBAL_FLAGS.has(name);
@@ -489,6 +490,15 @@ function argvHasFlag(argv, name) {
 }
 function argvHasExactFlag(argv, name) {
   const target = `--${name}`;
+  for (const token of argv) {
+    if (token === "--")
+      return false;
+    if (token === target)
+      return true;
+  }
+  return false;
+}
+function argvHasExactToken(argv, target) {
   for (const token of argv) {
     if (token === "--")
       return false;
@@ -3297,10 +3307,13 @@ function computeExpenseStats(db, vehicleId, options = {}) {
     distance,
     start_mileage: start?.mileage ?? null,
     end_mileage: end?.mileage ?? null,
+    distance_from_datetime: start?.datetime ?? null,
+    distance_to_datetime: end?.datetime ?? null,
     cost_per_km: totalPerKm,
     total_cost_per_km: totalPerKm,
     fuel_spent_per_km: perKm(fuel),
     fuel_consumption_cost: fuelEngine.overall?.cost ?? null,
+    fuel_consumption_distance: fuelEngine.overall?.distance ?? null,
     fuel_consumption_cost_per_km: fuelEngine.overall?.cost_per_km ?? null,
     maintenance_spent_per_km: perKm(maintenance),
     other_spent_per_km: perKm(other),
@@ -3528,6 +3541,11 @@ function formatDue(mileage, datetime) {
     parts.push(datetime);
   return parts.length > 0 ? parts.join(" / ") : "-";
 }
+function distanceCoverageLabel(from, to) {
+  if (from === null || to === null)
+    return "";
+  return `\uFF08${from.slice(0, 10)} \u2192 ${to.slice(0, 10)}\uFF09`;
+}
 function periodLabel(period) {
   if (period.year !== null && period.month !== null) {
     return `${period.year}\u5E74${period.month}\u6708`;
@@ -3602,7 +3620,10 @@ function renderSummaryHuman(ctx, summary) {
   } else if (totals.distance === 0) {
     writeLine(ctx, "  \u8DDD\u79BB 0 km\uFF0C\u6BCF\u516C\u91CC\u6210\u672C\u4E0D\u53EF\u7528");
   } else {
-    writeLine(ctx, `  \u8DDD\u79BB ${totals.distance.toLocaleString("zh-CN")} km\uFF1B` + `\u7EFC\u5408\u6210\u672C/\u516C\u91CC ${formatPerKm(totals.total_cost_per_km)} \u5143\uFF1B` + `\u71C3\u6CB9\u73B0\u91D1/\u516C\u91CC ${formatPerKm(totals.fuel_spent_per_km)} \u5143\uFF1B` + `\u71C3\u6CB9\u6D88\u8017\u6210\u672C/\u516C\u91CC ${formatPerKm(totals.fuel_consumption_cost_per_km)} \u5143`);
+    const coverage = distanceCoverageLabel(totals.distance_from_datetime, totals.distance_to_datetime);
+    const segmentDistance = totals.fuel_consumption_distance === null ? "-" : `${totals.fuel_consumption_distance.toLocaleString("zh-CN")} km`;
+    writeLine(ctx, `  \u8DDD\u79BB ${totals.distance.toLocaleString("zh-CN")} km${coverage}\uFF1B` + `\u7EFC\u5408\u6210\u672C/\u516C\u91CC ${formatPerKm(totals.total_cost_per_km)} \u5143\uFF1B` + `\u71C3\u6CB9\u73B0\u91D1/\u516C\u91CC ${formatPerKm(totals.fuel_spent_per_km)} \u5143`);
+    writeLine(ctx, `  \u71C3\u6CB9\u6D88\u8017\u6210\u672C/\u516C\u91CC ${formatPerKm(totals.fuel_consumption_cost_per_km)} \u5143\uFF08\u95ED\u5408\u5206\u6BB5 ${segmentDistance}\uFF09`);
     if (totals.daily_average !== null) {
       writeLine(ctx, `  \u65E5\u5747 ${formatCurrency(totals.daily_average)}` + (totals.days !== null ? `\uFF08${totals.days} \u5929\uFF09` : ""));
     }
@@ -6042,8 +6063,10 @@ function renderTotals(ctx, totals) {
   } else if (totals.distance === 0) {
     writeLine(ctx, "\u8DDD\u79BB: 0 km\uFF08\u6BCF\u516C\u91CC\u6210\u672C\u65E0\u6CD5\u8BA1\u7B97\uFF09");
   } else {
-    writeLine(ctx, `\u8DDD\u79BB: ${totals.distance.toLocaleString("zh-CN")} km\uFF1B` + `\u7EFC\u5408\u6210\u672C/\u516C\u91CC: ${totals.total_cost_per_km?.toFixed(3)} \u5143`);
-    writeLine(ctx, `\u71C3\u6CB9\u73B0\u91D1\u652F\u51FA/\u516C\u91CC: ${totals.fuel_spent_per_km?.toFixed(3)} \u5143\uFF1B` + `\u71C3\u6CB9\u6D88\u8017\u6210\u672C/\u516C\u91CC\uFF08\u5206\u6BB5\uFF09: ${totals.fuel_consumption_cost_per_km?.toFixed(3) ?? "-"} \u5143`);
+    const coverage = distanceCoverageLabel(totals.distance_from_datetime, totals.distance_to_datetime);
+    const segmentDistance = totals.fuel_consumption_distance === null ? "-" : `${totals.fuel_consumption_distance.toLocaleString("zh-CN")} km`;
+    writeLine(ctx, `\u8DDD\u79BB: ${totals.distance.toLocaleString("zh-CN")} km${coverage}\uFF1B` + `\u7EFC\u5408\u6210\u672C/\u516C\u91CC: ${totals.total_cost_per_km?.toFixed(3)} \u5143`);
+    writeLine(ctx, `\u71C3\u6CB9\u73B0\u91D1\u652F\u51FA/\u516C\u91CC: ${totals.fuel_spent_per_km?.toFixed(3)} \u5143\uFF1B` + `\u71C3\u6CB9\u6D88\u8017\u6210\u672C/\u516C\u91CC\uFF08\u95ED\u5408\u5206\u6BB5 ${segmentDistance}\uFF09: ${totals.fuel_consumption_cost_per_km?.toFixed(3) ?? "-"} \u5143`);
     writeLine(ctx, `\u4FDD\u517B/\u516C\u91CC: ${totals.maintenance_spent_per_km?.toFixed(3)} \u5143\uFF1B` + `\u5176\u4ED6/\u516C\u91CC: ${totals.other_spent_per_km?.toFixed(3)} \u5143`);
   }
   if (totals.daily_average !== null) {
@@ -6088,8 +6111,11 @@ var expenses = {
     "data.totals.other",
     "data.totals.total",
     "data.totals.distance",
+    "data.totals.distance_from_datetime",
+    "data.totals.distance_to_datetime",
     "data.totals.total_cost_per_km",
     "data.totals.fuel_spent_per_km",
+    "data.totals.fuel_consumption_distance",
     "data.totals.fuel_consumption_cost_per_km",
     "data.by_category",
     "data.by_month",
@@ -8256,6 +8282,7 @@ function renderUsage(ctx) {
     "  --db PATH   \u81EA\u5B9A\u4E49\u6570\u636E\u5E93\u8DEF\u5F84",
     "  --json      \u8F93\u51FA JSON \u4FE1\u5C01",
     "  --version   \u663E\u793A\u7248\u672C",
+    "  --help, -h  \u663E\u793A\u5E2E\u52A9",
     "",
     "\u547D\u4EE4:"
   ];
@@ -8303,6 +8330,44 @@ function renderCommandHelp(ctx, data) {
   writeLine(ctx, lines.join(`
 `));
 }
+function renderGroupHelp(ctx, pathTokens, matches) {
+  const groupPath = pathTokens.join(" ");
+  const lines = [
+    `carlog ${groupPath}`,
+    "",
+    "\u7528\u6CD5:",
+    `  carlog ${groupPath} <subcommand> [options]`,
+    "",
+    "\u5B50\u547D\u4EE4:"
+  ];
+  for (const spec of matches) {
+    lines.push(`  ${spec.path.join(" ")}  ${spec.summary}`);
+  }
+  lines.push("");
+  lines.push("\u4F7F\u7528 carlog help <\u547D\u4EE4> \u67E5\u770B\u547D\u4EE4\u8BE6\u60C5\u3002");
+  writeLine(ctx, lines.join(`
+`));
+}
+function runHelp(ctx, pathTokens, json) {
+  const exact = pathTokens.length > 0 ? findCommand(COMMANDS, pathTokens) : undefined;
+  const matches = exact ? [exact] : COMMANDS.filter((spec) => spec.path.length > pathTokens.length && pathTokens.every((segment, index) => spec.path[index] === segment));
+  if (matches.length === 0) {
+    throw new AppError("UNKNOWN_COMMAND", `\u672A\u77E5\u547D\u4EE4\uFF1A${pathTokens.join(" ")}`, { details: { command: pathTokens.join(" ") } });
+  }
+  if (json) {
+    emitSuccess(ctx, true, { commands: matches.map(helpData) });
+    return;
+  }
+  if (exact) {
+    renderCommandHelp(ctx, helpData(exact));
+    return;
+  }
+  if (pathTokens.length === 0) {
+    renderUsage(ctx);
+    return;
+  }
+  renderGroupHelp(ctx, pathTokens, matches);
+}
 var help = {
   path: ["help"],
   summary: "\u663E\u793A\u5E2E\u52A9",
@@ -8325,23 +8390,7 @@ var help = {
   ],
   errorCodes: ["UNKNOWN_COMMAND"],
   handler: (ctx, inv) => {
-    if (inv.positionals.length === 0) {
-      if (inv.globals.json) {
-        emitSuccess(ctx, true, { commands: COMMANDS.map(helpData) });
-      } else {
-        renderUsage(ctx);
-      }
-      return;
-    }
-    const spec = findCommand(COMMANDS, inv.positionals);
-    if (!spec) {
-      throw new AppError("UNKNOWN_COMMAND", `\u672A\u77E5\u547D\u4EE4\uFF1A${inv.positionals.join(" ")}`, { details: { command: inv.positionals.join(" ") } });
-    }
-    if (inv.globals.json) {
-      emitSuccess(ctx, true, { commands: [helpData(spec)] });
-    } else {
-      renderCommandHelp(ctx, helpData(spec));
-    }
+    runHelp(ctx, inv.positionals, inv.globals.json);
   }
 };
 var COMMANDS = [
@@ -8373,6 +8422,26 @@ function renderVersion(ctx, json) {
     writeLine(target, `carlog ${value.version} (JSON schema ${value.schema_version}, DB schema ${value.db_schema_version})`);
   });
 }
+function helpPathTokens(argv) {
+  const tokens = [];
+  for (let index = 0;index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--")
+      break;
+    if (token === "--json")
+      continue;
+    if (token === "--db") {
+      index += 1;
+      continue;
+    }
+    if (token.startsWith("--db="))
+      continue;
+    if (token.startsWith("-"))
+      break;
+    tokens.push(token);
+  }
+  return tokens;
+}
 function runCli(argv, input = {}) {
   const stdoutChunks = [];
   const stderrChunks = [];
@@ -8395,6 +8464,8 @@ function runCli(argv, input = {}) {
   try {
     if (argv.length === 0) {
       renderUsage(ctx);
+    } else if (argvHasExactFlag(argv, "help") || argvHasExactToken(argv, "-h")) {
+      runHelp(ctx, helpPathTokens(argv), argvHasFlag(argv, "json"));
     } else if (argvHasExactFlag(argv, "version")) {
       renderVersion(ctx, argvHasFlag(argv, "json"));
     } else {

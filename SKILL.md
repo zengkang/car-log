@@ -17,6 +17,8 @@ bun scripts/carlog.js [命令] [子命令] [选项]
 
 脚本仍然需要 Bun 运行，因为项目使用 Bun 内置的 `bun:sqlite`；它不是脱离 Bun 的独立二进制。数据库默认在 `~/.car-log/car_log.db`，可用 `--db PATH` 或环境变量 `CAR_LOG_DB` 覆盖。
 
+查参数：`bun scripts/carlog.js help <命令> --json`；也可以在命令后加 `--help` 或 `-h`，例如 `bun scripts/carlog.js refuel add --help --json`。`help <分组>` 会列出该组下的子命令（如 `help maintenance rule`）。
+
 ## 源码与安装
 
 源码在主仓库 `git@github.com:zengkang/car-tracker.git` 的 `src/`；本 skill 是子模块 `skills/car-log`（`git@github.com:zengkang/car-log.git`）。修改源码后：
@@ -102,7 +104,7 @@ bun scripts/carlog.js export --car <车辆|all> [--output FILE] [--include-delet
 bun scripts/carlog.js import --file FILE [--dry-run] [--replace] [--yes]
 bun scripts/carlog.js doctor [--car CAR]
 bun scripts/carlog.js delete-all [--car CAR] [--type mileage|refuel|maintenance] --yes
-bun scripts/carlog.js help [command]
+bun scripts/carlog.js help [command...]        # 命令或命令组，如 help maintenance rule
 ```
 
 `stats current-mileage` 是 `stats` 下的完整命令路径（带连字符）。`maintenance item` 和 `maintenance rule` 是子命令组。
@@ -184,6 +186,7 @@ add/update 的 JSON 响应已经包含油耗、提醒和费用上下文：
 - 多辆车且无法从用户说法中唯一匹配：列出候选，问"是哪辆车"。
 - 加油没有说明是否加满：先问"这次加满了吗？"。用户不回答时不要写库；CLI 会以 `FULLNESS_REQUIRED` 拒绝缺少 `--full`/`--partial` 的记录。
 - 不要根据加油量自行判断是否加满：加得少不等于没加满（可能只是油箱没空），必须由用户明确说明。
+- 用户发的是加油小票或截图：票面通常只有金额、升数和里程，没有加满信息。只问一次"这次加满了吗？"，不要按升数或油箱容量推断。用户无法判断时先不要写库；如果用户选择按未加满记录，说明本次会进入待结算区间。
 - 用户说"没加满"：可以再问"加完油后油表大概在什么位置？"（可选）。给出比例时用 `--fuel-level`（隐含 `--partial`）；不给出时只用 `--partial`。
 - 用户说"加了一半"：先确认是"加了半箱油"还是"加完后油表在一半"。
 - 保养项目无法解析：给出候选或问"具体换了什么"，不要静默使用 `other`。
@@ -205,6 +208,10 @@ bun scripts/carlog.js maintenance update <ID> --items 机油,机滤 --json
 2. 用 `maintenance item list --json` 或用户描述提议项目代码/名称。
 3. 用户确认后，对每条记录单独执行 `maintenance update <ID> --items ... --json`。
 4. 不批量猜项目、不创建名为"其他"的占位关联。
+
+`doctor` 的 `suggested_command` 是模板：`项目代码`、`KM` 等是占位符，不能直接复制执行；先解析出项目再替换。`RULE_WITHOUT_ANCHOR` 的基线里程应取当前里程，日期取用户确认的日期，不要照抄 `KM`。
+
+记录较多时，先按记录时间或备注把 `MAINTENANCE_ITEMS_UNLINKED` 分组，一次向用户确认整批「记录 → 项目」映射，再逐条执行 `maintenance update`。不同记录不要套用同一组项目。
 
 ## 错误恢复
 
@@ -275,5 +282,8 @@ warnings（`data.warnings[].code`）：
 4. **加满/未加满必须显式**：`--full` 或 `--partial`；`--fuel-level` 隐含未加满。不要默认加满。
 5. **里程是总里程**：用户说"今天跑了 300 公里"时，从上下文推断总里程，不要写增量。
 6. **项目解析**：`--items` 支持代码、中文名称、别名，可用逗号、顿号分隔或重复传；无法识别时给候选，不猜。
-7. **成本口径**：`fuel_consumption_cost_per_km` 是已闭合分段口径，`fuel_spent_per_km` 是现金支出口径，不要混用。
+7. **成本口径要带分母**：`fuel_consumption_cost_per_km` 的分母是 `fuel_consumption_distance`（已闭合分段）；`fuel_spent_per_km` / `total_cost_per_km` 的分母是 `distance`（`distance_from_datetime` → `distance_to_datetime` 的现金窗口）。两个分母可能不同，不要混用或互相换算；转述时写清各自的分母。
 8. **提醒排序**：先按状态分桶 `overdue` → `due_soon` → `ok` → `unknown`，桶内按最紧急的归一化剩余值（`min(remaining_km/due_soon_km, remaining_days/due_soon_days)`）排序，同值按项目代码；只主动转述前两类。
+9. **`unknown` 项目必须判空**：`status = "unknown"` 时，`next_due_mileage`、`next_due_datetime`、`remaining_km`、`remaining_days` 可能全为 `null`。比较、排序、切片或做算术前先判空，不要把 `null` 当 0。
+10. **`maintenance rule set` 是部分更新**：只改传入的字段；未传字段保留本车现有覆盖，本车没有覆盖时继承目录默认。传入任意规则字段会把已禁用的规则重新启用；要停用请传 `--disable`。
+11. **目录项是全局的**：`maintenance item add/update` 修改的是所有车辆共享的目录；只想改这辆车的周期用 `maintenance rule set`。
